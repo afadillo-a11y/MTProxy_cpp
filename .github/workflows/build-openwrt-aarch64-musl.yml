@@ -99,7 +99,6 @@ jobs:
       - name: Patch Makefile for cross-build
         shell: bash
         run: |
-          # 1) Жестко прописываем версию прямо в Makefile
           sed -i 's/VERSION :=.*/VERSION := v3.0.12/g' Makefile
           sed -i 's/COMMIT :=.*/COMMIT := v3.0.12/g' Makefile
           cp Makefile Makefile.orig
@@ -127,35 +126,88 @@ jobs:
               if not p.exists(): return
               content = p.read_text(encoding='utf-8')
               for pattern, repl in patches:
-                  content = re.sub(pattern, lambda _, r=repl: r, content, flags=re.DOTALL)
+                  content = re.sub(pattern, lambda _, r=repl: r, content, flags=re.DOTALL | re.MULTILINE)
               p.write_text(content, encoding='utf-8')
 
-          # 2) Вычищаем мусор из строк вывода во всех исходниках
-          for f in Path('.').rglob('*.c'):
-              s = f.read_text(encoding='utf-8')
-              s = re.sub(r'"\s*by gcc\s*"\s*__VERSION__\s*"\s*"', '""', s)
-              s = re.sub(r'#ifdef __LP64__\s*"64-bit"\s*#else\s*"32-bit"\s*#endif', '""', s)
-              s = re.sub(r'"\s*after commit\s*"\s*COMMIT', '""', s)
-              s = re.sub(r'"\s*after commit\s*"\s*STR\(COMMIT\)', '""', s)
-              f.write_text(s, encoding='utf-8')
+          def append_to_file(path, text):
+              p = Path(path)
+              if p.exists():
+                  content = p.read_text(encoding='utf-8')
+                  if text.strip() not in content:
+                      p.write_text(content + text, encoding='utf-8')
 
-          # 3) Обычные патчи для совместимости x86 -> ARM и musl
+          def replace_func(filepath, func_name, new_code):
+              p = Path(filepath)
+              if not p.exists(): return
+              content = p.read_text(encoding='utf-8')
+              search_start = 0
+              while True:
+                  idx = content.find(func_name, search_start)
+                  if idx == -1: break
+                  start_brace = content.find('{', idx)
+                  semi = content.find(';', idx)
+                  if semi != -1 and semi < start_brace:
+                      search_start = semi + 1
+                      continue
+                  if start_brace != -1:
+                      brace_count = 0
+                      end_brace = -1
+                      for i in range(start_brace, len(content)):
+                          if content[i] == '{': brace_count += 1
+                          elif content[i] == '}':
+                              brace_count -= 1
+                              if brace_count == 0:
+                                  end_brace = i
+                                  break
+                      if end_brace != -1:
+                          line_start = content.rfind('\n', 0, idx)
+                          if line_start == -1: line_start = 0
+                          content = content[:line_start] + '\n' + new_code + '\n' + content[end_brace+1:]
+                          p.write_text(content, encoding='utf-8')
+                          return
+                  search_start = idx + len(func_name)
+
+          # 1. Избавляемся от мусора в логах (Backtrace и версия)
+          replace_func("common/server-functions.c", "print_backtrace", "void print_backtrace(void) {}")
+          replace_func("common/server-functions.c", "get_version_string", 'const char *get_version_string(void) { return "mtproxy-v3.0.12"; }')
+          
+          patch_file("common/server-functions.c", [(r'#include\s+<execinfo\.h>', '')])
+          
+          patch_file("mtproto/mtproto-proxy.c", [
+              (r'printf\s*\(\s*"%s compiled at.*?COMMIT\s*\);', 'printf ("%s (v3.0.12) compiled at %s %s\\n", progname, __DATE__, __TIME__);')
+          ])
+          patch_file("engine/engine.c", [
+              (r'vkprintf\s*\(\s*0\s*,\s*"Invoking engine.*?COMMIT\s*\);', 'vkprintf (0, "Invoking engine %s (v3.0.12) compiled at %s %s\\n", progname, __DATE__, __TIME__);')
+          ])
+
+          # 2. Исправляем баг с __LP64__ (Главная причина сбоя crc32.c на AArch64)
+          patch_file("common/crc32.c", [
+              (r'#ifdef\s+__LP64__', '#if defined(__x86_64__)'),
+              (r'#include\s+<wmmintrin\.h>', '#if defined(__i386__) || defined(__x86_64__)\n#include <wmmintrin.h>\n#endif'),
+              (r'void\s+crc32_init\s*\(void\)\s*\{.*', 'void crc32_init (void) {\n#if defined(__i386__) || defined(__x86_64__)\n  kdb_cpuid_t *p = kdb_cpuid ();\n  if (p->ecx & 2) {\n    crc32_partial = crc32_partial_clmul;\n    crc64_partial = crc64_partial_clmul;\n    compute_crc32_combine = compute_crc32_combine_clmul;\n    compute_crc64_combine = compute_crc64_combine_clmul;\n  } else {\n    crc32_partial = crc32_partial_generic;\n    crc64_partial = crc64_partial_one_table;\n    compute_crc32_combine = compute_crc32_combine_generic;\n    compute_crc64_combine = compute_crc64_combine_generic;\n  }\n#else\n  crc32_partial = crc32_partial_generic;\n  crc64_partial = crc64_partial_one_table;\n  compute_crc32_combine = compute_crc32_combine_generic;\n  compute_crc64_combine = compute_crc64_combine_generic;\n#endif\n}')
+          ])
+          
+          patch_file("common/crc32c.c", [
+              (r'#ifdef\s+__LP64__', '#if defined(__x86_64__)'),
+              (r'#else\s*static\s+unsigned\s+crc32c_partial_sse42', '#elif defined(__i386__)\nstatic unsigned crc32c_partial_sse42'),
+              (r'#include\s+<wmmintrin\.h>', '#if defined(__i386__) || defined(__x86_64__)\n#include <wmmintrin.h>\n#endif'),
+              (r'void\s+crc32c_init\s*\(void\)\s*\{.*', 'void crc32c_init (void) {\n  compute_crc32c_combine = &crc32c_combine_generic;\n#if defined(__i386__) || defined(__x86_64__)\n  kdb_cpuid_t *p = kdb_cpuid ();\n  if (p->ecx & (1 << 20)) {\n    crc32c_partial = crc32c_partial_sse42;\n  #ifdef __x86_64__\n    if (p->ecx & 2) {\n      crc32c_partial = crc32c_partial_sse42_clmul;\n      compute_crc32c_combine = &crc32c_combine_clmul;\n    }\n  #endif\n  } else {\n    crc32_partial = &crc32c_partial_four_tables;\n  }\n#else\n  crc32_partial = &crc32c_partial_four_tables;\n#endif\n}')
+          ])
+
+          # 3. Базовые заглушки для архитектуры ARM / musl
           patch_file("engine/engine-rpc.h", [
               (r'#include\s+<x86intrin\.h>', '#if defined(__i386__) || defined(__x86_64__)\n#include <x86intrin.h>\n#else\n#include "common/precise-time.h"\n#define __rdtsc rdtsc\n#endif')
           ])
-
           patch_file("common/precise-time.h", [
               (r'#endif\s*/\*\s*net-event\.h\s*\*/', '#else\nstatic __inline__ unsigned long long rdtsc(void) {\n  struct timespec ts;\n  clock_gettime(CLOCK_MONOTONIC_RAW, &ts);\n  return (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec;\n}\n#endif\n/* net-event.h */')
           ])
+          append_to_file("common/precise-time.c", "\n#if !defined(__i386__) && !defined(__x86_64__)\nunsigned long long __rdtsc(void) {\n  struct timespec ts;\n  clock_gettime(CLOCK_MONOTONIC_RAW, &ts);\n  return (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec;\n}\n#endif\n")
 
           patch_file("common/server-functions.h", [
               (r'static\s+inline\s+void\s+mfence\s*\(\s*void\s*\)\s*\{\s*asm\s+volatile\s*\(\s*"mfence"\s*:\s*:\s*:"memory"\s*\);\s*\}', 'static inline void mfence (void) {\n#if defined(__i386__) || defined(__x86_64__)\n  asm volatile ("mfence": : :"memory");\n#else\n  __sync_synchronize();\n#endif\n}')
           ])
 
-          patch_file("jobs/jobs.h", [
-              (r'struct\s+drand48_data\s+rand_data;', 'unsigned short rand_data[3];')
-          ])
-          
+          patch_file("jobs/jobs.h", [(r'struct\s+drand48_data\s+rand_data;', 'unsigned short rand_data[3];')])
           patch_file("jobs/jobs.c", [
               (r'lrand48_r\s*\([^,]+,\s*&t\);', 'return nrand48(this_job_thread->rand_data);'),
               (r'mrand48_r\s*\([^,]+,\s*&t\);', 'return jrand48(this_job_thread->rand_data);'),
@@ -165,25 +217,7 @@ jobs:
 
           patch_file("common/cpuid.c", [
               (r'#include\s+<cpuid\.h>', '#if defined(__i386__) || defined(__x86_64__)\n#include <cpuid.h>\n#endif'),
-              (r'kdb_cpuid_t\s*\*kdb_cpuid\s*\(void\)\s*\{.*', 'kdb_cpuid_t *kdb_cpuid (void) {\n#if defined(__i386__) || defined(__x86_64__)\n  static kdb_cpuid_t cached = { .magic = 0 };\n  if (cached.magic) {\n    assert (cached.magic == CPUID_MAGIC);\n    return &cached;\n  }\n  unsigned int a;\n  assert(__get_cpuid(1, &a, (unsigned int*) &cached.ebx, (unsigned int*) &cached.ecx, (unsigned int*) &cached.edx) != 0);\n  cached.magic = CPUID_MAGIC;\n  return &cached;\n#else\n  static kdb_cpuid_t cached = { .magic = 0x280147b8, .ebx = 0, .ecx = 0, .edx = 0 };\n  return &cached;\n#endif\n}')
-          ])
-
-          patch_file("common/crc32c.c", [
-              (r'#include\s+<wmmintrin\.h>', '#if defined(__i386__) || defined(__x86_64__)\n#include <wmmintrin.h>\n#endif'),
-              (r'#ifdef\s+__LP64__', '#if defined(__x86_64__)'),
-              (r'#else\s*static\s+unsigned\s+crc32c_partial_sse42', '#elif defined(__i386__)\nstatic unsigned crc32c_partial_sse42'),
-              (r'void\s+crc32c_init\s*\(void\)\s*\{.*', 'void crc32c_init (void) {\n  compute_crc32c_combine = &crc32c_combine_generic;\n#if defined(__i386__) || defined(__x86_64__)\n  kdb_cpuid_t *p = kdb_cpuid ();\n  if (p->ecx & (1 << 20)) {\n    crc32c_partial = crc32c_partial_sse42;\n  #ifdef __x86_64__\n    if (p->ecx & 2) {\n      crc32c_partial = crc32c_partial_sse42_clmul;\n      compute_crc32c_combine = &crc32c_combine_clmul;\n    }\n  #endif\n  } else {\n    crc32c_partial = &crc32c_partial_four_tables;\n  }\n#else\n  crc32c_partial = &crc32c_partial_four_tables;\n#endif\n}')
-          ])
-          
-          patch_file("common/crc32.c", [
-              (r'#include\s+<wmmintrin\.h>', '#if defined(__i386__) || defined(__x86_64__)\n#include <wmmintrin.h>\n#endif'),
-              (r'void\s+crc32_init\s*\(void\)\s*\{.*', 'void crc32_init (void) {\n#if defined(__i386__) || defined(__x86_64__)\n  kdb_cpuid_t *p = kdb_cpuid ();\n  if (p->ecx & 2) {\n    crc32_partial = crc32_partial_clmul;\n    crc64_partial = crc64_partial_clmul;\n    compute_crc32_combine = compute_crc32_combine_clmul;\n    compute_crc64_combine = compute_crc64_combine_clmul;\n  } else {\n    crc32_partial = crc32_partial_generic;\n    crc64_partial = crc64_partial_one_table;\n    compute_crc32_combine = compute_crc32_combine_generic;\n    compute_crc64_combine = compute_crc64_combine_generic;\n  }\n#else\n  crc32_partial = crc32_partial_generic;\n  crc64_partial = crc64_partial_one_table;\n  compute_crc32_combine = compute_crc32_combine_generic;\n  compute_crc64_combine = compute_crc64_combine_generic;\n#endif\n}')
-          ])
-
-          # 4) Полностью вырезаем тело backtrace
-          patch_file("common/server-functions.c", [
-              (r'#include\s+<execinfo\.h>', '#if defined(__GLIBC__)\n#include <execinfo.h>\n#endif'),
-              (r'void\s+print_backtrace\s*\(void\)\s*\{.*?\n\}\n*(?=pthread_t\s+debug_main_pthread_id;)', 'void print_backtrace (void) {}\n\n')
+              (r'kdb_cpuid_t\s*\*kdb_cpuid\s*\(void\)\s*\{.*', 'kdb_cpuid_t *kdb_cpuid (void) {\n#if defined(__i386__) || defined(__x86_64__)\n  static kdb_cpuid_t cached = { .magic = 0 };\n  if (cached.magic) { return &cached; }\n  unsigned int a;\n  __get_cpuid(1, &a, (unsigned int*) &cached.ebx, (unsigned int*) &cached.ecx, (unsigned int*) &cached.edx);\n  cached.magic = 0x280147b8;\n  return &cached;\n#else\n  static kdb_cpuid_t cached = { .magic = 0x280147b8, .ebx = 0, .ecx = 0, .edx = 0 };\n  return &cached;\n#endif\n}')
           ])
           PY
 
