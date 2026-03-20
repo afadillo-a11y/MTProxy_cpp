@@ -114,6 +114,104 @@ jobs:
           echo "===== Makefile diff ====="
           diff -u Makefile.orig Makefile || true
 
+      - name: Patch sources for aarch64 + musl
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def patch(path, transform):
+              p = Path(path)
+              s = p.read_text()
+              ns = transform(s)
+              if ns != s:
+                  p.write_text(ns)
+
+          # 1) x86intrin only on x86
+          def fix_engine_rpc(s: str) -> str:
+              old = '#include "common/precise-time.h"\n#include <x86intrin.h>\n\n#ifndef rdtsc\n#define rdtsc __rdtsc\n#endif'
+              new = (
+                  '#include "common/precise-time.h"\n'
+                  '#if defined(__i386__) || defined(__x86_64__)\n'
+                  '#include <x86intrin.h>\n\n'
+                  '#ifndef rdtsc\n'
+                  '#define rdtsc __rdtsc\n'
+                  '#endif\n'
+                  '#endif'
+              )
+              return s.replace(old, new)
+
+          patch('engine/engine-rpc.h', fix_engine_rpc)
+
+          # 2) rdtsc fallback on non-x86
+          def fix_precise_time(s: str) -> str:
+              marker = '#endif\n\n/* net-event.h */'
+              repl = (
+                  '#else\n'
+                  'static __inline__ unsigned long long rdtsc(void) {\n'
+                  '  struct timespec ts;\n'
+                  '  clock_gettime(CLOCK_MONOTONIC_RAW, &ts);\n'
+                  '  return (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec;\n'
+                  '}\n'
+                  '#endif\n\n/* net-event.h */'
+              )
+              return s.replace(marker, repl)
+
+          patch('common/precise-time.h', fix_precise_time)
+
+          # 3) mfence fallback on non-x86
+          def fix_server_functions(s: str) -> str:
+              old = '''static inline void mfence (void) {
+              asm volatile ("mfence": : :"memory");
+            }'''
+              new = '''static inline void mfence (void) {
+            #if defined(__i386__) || defined(__x86_64__)
+              asm volatile ("mfence": : :"memory");
+            #else
+              __sync_synchronize();
+            #endif
+            }'''
+              return s.replace(old, new)
+
+          patch('common/server-functions.h', fix_server_functions)
+
+          # 4) musl-friendly RNG storage in jobs/jobs.h
+          def fix_jobs_h(s: str) -> str:
+              return s.replace('  struct drand48_data rand_data;', '  unsigned short rand_data[3];')
+
+          patch('jobs/jobs.h', fix_jobs_h)
+
+          # 5) replace *_r drand48 API in jobs/jobs.c
+          def fix_jobs_c(s: str) -> str:
+              s = s.replace(
+                  '    long int t;\n    lrand48_r (&this_job_thread->rand_data, &t);\n    return t;',
+                  '    return nrand48 (this_job_thread->rand_data);'
+              )
+              s = s.replace(
+                  '    long int t;\n    mrand48_r (&this_job_thread->rand_data, &t);\n    return t;',
+                  '    return jrand48 (this_job_thread->rand_data);'
+              )
+              s = s.replace(
+                  '    double t;\n    drand48_r (&this_job_thread->rand_data, &t);\n    return t;',
+                  '    return erand48 (this_job_thread->rand_data);'
+              )
+              s = s.replace(
+                  '  srand48_r (rdtsc () ^ lrand48 (), &JT->rand_data);',
+                  '  {\n'
+                  '    unsigned long long seed = (unsigned long long)rdtsc() ^ (unsigned long long)lrand48();\n'
+                  '    JT->rand_data[0] = (unsigned short)(seed & 0xffffu);\n'
+                  '    JT->rand_data[1] = (unsigned short)((seed >> 16) & 0xffffu);\n'
+                  '    JT->rand_data[2] = (unsigned short)((seed >> 32) & 0xffffu);\n'
+                  '  }'
+              )
+              return s
+
+          patch('jobs/jobs.c', fix_jobs_c)
+          PY
+
+          echo "===== grep after patch ====="
+          grep -RIn "x86intrin.h\|drand48_data\|srand48_r\|lrand48_r\|mrand48_r\|drand48_r" engine jobs common || true
+
       - name: Build MTProxy (static musl)
         shell: bash
         run: |
