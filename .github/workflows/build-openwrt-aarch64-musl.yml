@@ -99,6 +99,9 @@ jobs:
       - name: Patch Makefile for cross-build
         shell: bash
         run: |
+          # Жестко прописываем версию прямо в Makefile
+          sed -i 's/VERSION :=.*/VERSION := v3.0.12/g' Makefile
+          sed -i 's/COMMIT :=.*/COMMIT := v3.0.12/g' Makefile
           cp Makefile Makefile.orig
 
           python3 - <<'PY'
@@ -112,15 +115,11 @@ jobs:
               p.write_text(s)
           PY
 
-          echo "===== Makefile diff ====="
-          diff -u Makefile.orig Makefile || true
-
       - name: Patch sources for aarch64 + musl
         shell: bash
         run: |
           python3 - <<'PY'
           import re
-          import subprocess
           from pathlib import Path
 
           def patch_file(path, patches):
@@ -234,43 +233,20 @@ jobs:
               (r'void\s+crc32_init\s*\(void\)\s*\{.*', 'void crc32_init (void) {\n#if defined(__i386__) || defined(__x86_64__)\n  kdb_cpuid_t *p = kdb_cpuid ();\n  if (p->ecx & 2) {\n    crc32_partial = crc32_partial_clmul;\n    crc64_partial = crc64_partial_clmul;\n    compute_crc32_combine = compute_crc32_combine_clmul;\n    compute_crc64_combine = compute_crc64_combine_clmul;\n  } else {\n    crc32_partial = crc32_partial_generic;\n    crc64_partial = crc64_partial_one_table;\n    compute_crc32_combine = compute_crc32_combine_generic;\n    compute_crc64_combine = compute_crc64_combine_generic;\n  }\n#else\n  crc32_partial = crc32_partial_generic;\n  crc64_partial = crc64_partial_one_table;\n  compute_crc32_combine = compute_crc32_combine_generic;\n  compute_crc64_combine = compute_crc64_combine_generic;\n#endif\n}')
           ])
 
-          # 7) common/server-functions.c
+          # 7) common/server-functions.c (Наглухо удаляем бэктрейс и get_version)
           patch_file("common/server-functions.c", [
               (r'#include\s+<execinfo\.h>', '#if defined(__GLIBC__)\n#include <execinfo.h>\n#endif'),
-              (r'void\s+print_backtrace\s*\(void\)\s*\{.*?\n\}\n*(?=pthread_t\s+debug_main_pthread_id;)', 
-               'void print_backtrace (void) {\n'
-               '#if defined(__GLIBC__)\n'
-               '  void *buffer[64];\n'
-               '  int nptrs = backtrace (buffer, 64);\n'
-               '  kwrite (2, "\\n------- Stack Backtrace -------\\n", 33);\n'
-               '  backtrace_symbols_fd (buffer, nptrs, 2);\n'
-               '  kwrite (2, "-------------------------------\\n", 32);\n'
-               '  const char *s = get_version_string ();\n'
-               '  if (s) {\n'
-               '    kwrite (2, s, strlen (s));\n'
-               '    kwrite (2, "\\n", 1);\n'
-               '  }\n'
-               '#else\n'
-               '  kwrite (2, "\\n------- Stack Backtrace -------\\n", 33);\n'
-               '  kwrite (2, "backtrace unavailable on musl\\n", 30);\n'
-               '  kwrite (2, "-------------------------------\\n", 32);\n'
-               '#endif\n'
-               '}\n\n')
+              (r'void\s+print_backtrace\s*\(void\)\s*\{.*?\n\}\n*(?=pthread_t\s+debug_main_pthread_id;)', 'void print_backtrace (void) {}\n\n'),
+              (r'const\s+char\s*\*get_version_string\s*\(void\)\s*\{.*?\}', 'const char *get_version_string(void) { return "mtproxy-v3.0.12"; }')
           ])
 
-          # 8) Делаем красивую строку версии: оставляем только тег и время сборки
-          try:
-              tag_version = subprocess.check_output(['git', 'describe', '--tags', '--abbrev=0'], stderr=subprocess.DEVNULL).decode().strip()
-          except Exception:
-              tag_version = "v3.0.12"
-
-          version_func = f'const char *get_version_string (void) {{\n  return "mtproxy-{tag_version} compiled at " __DATE__ " " __TIME__;\n}}'
-
+          # 8) mtproto-proxy.c и engine.c (Радикальное удаление Clang/commit из C-кода)
           patch_file("mtproto/mtproto-proxy.c", [
-              (r'const\s+char\s*\*get_version_string\s*\(void\)\s*\{.*?\}', version_func)
+              (r'printf\s*\(\s*"%s compiled at.*?,\s*COMMIT\s*\);', 'printf ("%s (v3.0.12) compiled at %s %s\\n", progname, __DATE__, __TIME__);')
           ])
-          patch_file("common/server-functions.c", [
-              (r'const\s+char\s*\*get_version_string\s*\(void\)\s*\{.*?\}', version_func)
+          
+          patch_file("engine/engine.c", [
+              (r'vkprintf\s*\(\s*0\s*,\s*"Invoking engine.*?,\s*COMMIT\s*\);', 'vkprintf (0, "Invoking engine %s (v3.0.12) compiled at %s %s\\n", progname, __DATE__, __TIME__);')
           ])
           PY
 
