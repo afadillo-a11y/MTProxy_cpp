@@ -124,7 +124,6 @@ jobs:
               p = Path(path)
               if not p.exists(): return
               content = p.read_text(encoding='utf-8')
-              # Используем re.DOTALL чтобы символ '.' захватывал и переносы строк
               for pattern, repl in patches:
                   content = re.sub(pattern, repl, content, flags=re.DOTALL)
               p.write_text(content, encoding='utf-8')
@@ -158,10 +157,10 @@ jobs:
           # 5) common/cpuid.c
           patch_file("common/cpuid.c", [
               (r'#include\s+<cpuid\.h>', '#if defined(__i386__) || defined(__x86_64__)\n#include <cpuid.h>\n#endif'),
-              (r'kdb_cpuid_t\s*\*kdb_cpuid\s*\(void\)\s*\{.*?return\s*&cached;\s*\}', 'kdb_cpuid_t *kdb_cpuid (void) {\n#if defined(__i386__) || defined(__x86_64__)\n  static kdb_cpuid_t cached = { .magic = 0 };\n  if (cached.magic) {\n    assert (cached.magic == CPUID_MAGIC);\n    return &cached;\n  }\n  unsigned int a;\n  assert(__get_cpuid(1, &a, (unsigned int*) &cached.ebx, (unsigned int*) &cached.ecx, (unsigned int*) &cached.edx) != 0);\n  cached.magic = CPUID_MAGIC;\n  return &cached;\n#else\n  static kdb_cpuid_t cached = { .magic = 0x280147b8, .ebx = 0, .ecx = 0, .edx = 0 };\n  return &cached;\n#endif\n}')
+              (r'kdb_cpuid_t\s*\*kdb_cpuid\s*\(void\)\s*\{.*', 'kdb_cpuid_t *kdb_cpuid (void) {\n#if defined(__i386__) || defined(__x86_64__)\n  static kdb_cpuid_t cached = { .magic = 0 };\n  if (cached.magic) {\n    assert (cached.magic == CPUID_MAGIC);\n    return &cached;\n  }\n  unsigned int a;\n  assert(__get_cpuid(1, &a, (unsigned int*) &cached.ebx, (unsigned int*) &cached.ecx, (unsigned int*) &cached.edx) != 0);\n  cached.magic = CPUID_MAGIC;\n  return &cached;\n#else\n  static kdb_cpuid_t cached = { .magic = 0x280147b8, .ebx = 0, .ecx = 0, .edx = 0 };\n  return &cached;\n#endif\n}')
           ])
 
-          # 6) common/crc32c.c and common/crc32.c (Используем .* чтобы безопасно затереть все до конца файла)
+          # 6) common/crc32c.c and common/crc32.c
           patch_file("common/crc32c.c", [
               (r'#include\s+<wmmintrin\.h>', '#if defined(__i386__) || defined(__x86_64__)\n#include <wmmintrin.h>\n#endif'),
               (r'#ifdef\s+__LP64__', '#if defined(__x86_64__)'),
