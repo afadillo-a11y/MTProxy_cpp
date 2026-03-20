@@ -1,4 +1,4 @@
-name: build-openwrt-aarch64-musl
+name: build-MTProxy-openwrt-aarch64-musl
 
 on:
   workflow_dispatch:
@@ -22,6 +22,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Обязательно выкачиваем историю, чтобы Git увидел теги (v3.0.12)
 
       - name: Install host tools
         run: |
@@ -168,10 +170,10 @@ jobs:
 
           # 1) engine/engine-rpc.h
           patch_file("engine/engine-rpc.h", [
-              (r'#include\s+<x86intrin\.h>', '#if defined(__i386__) || defined(__x86_64__)\n#include <x86intrin.h>\n#endif')
+              (r'#include\s+<x86intrin\.h>', '#if defined(__i386__) || defined(__x86_64__)\n#include <x86intrin.h>\n#else\n#include "common/precise-time.h"\n#define __rdtsc rdtsc\n#endif')
           ])
 
-          # 2) common/precise-time.h & precise-time.c (Fixes undefined symbol: __rdtsc)
+          # 2) common/precise-time.h & precise-time.c
           patch_file("common/precise-time.h", [
               (r'#endif\s*/\*\s*net-event\.h\s*\*/', '#else\nstatic __inline__ unsigned long long rdtsc(void) {\n  struct timespec ts;\n  clock_gettime(CLOCK_MONOTONIC_RAW, &ts);\n  return (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec;\n}\n#endif\n/* net-event.h */')
           ])
@@ -254,6 +256,11 @@ jobs:
                '#endif\n'
                '}\n\n')
           ])
+
+          # 8) Делаем красивую строку версии: оставляем только тег и время сборки
+          patch_file("mtproto/mtproto-proxy.c", [
+              (r'return\s+"mtproxy-"\s*STR\(VERSION\).*?;', 'return "mtproxy-" STR(VERSION) " compiled at " __DATE__ " " __TIME__;')
+          ])
           PY
 
       - name: Build MTProxy (static musl)
@@ -278,12 +285,17 @@ jobs:
             -L${GITHUB_WORKSPACE}/deps/lib64 \
             -Wl,--start-group -lcrypto -lz -lpthread -lm -lrt -Wl,--end-group"
 
+          # Вытягиваем последний актуальный тег (например, v3.0.12)
+          export TAG_VERSION=$(git describe --tags --abbrev=0 2>/dev/null || echo "v3.0.12")
+
           echo "HOST_ARCH=${HOST_ARCH}"
           echo "CC=${CC}"
           echo "CFLAGS=${CFLAGS}"
           echo "LDFLAGS=${LDFLAGS}"
+          echo "VERSION=${TAG_VERSION}"
 
-          make V=1 2>&1 | tee build.log
+          # Передаем чистый тег в макрос VERSION
+          make V=1 VERSION="${TAG_VERSION}" 2>&1 | tee build.log
 
       - name: Inspect binary
         if: always()
