@@ -3,9 +3,7 @@ name: build-openwrt-aarch64-musl
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
-      - master
+    branches: [ main, master ]
     tags:
       - 'v*'
 
@@ -14,9 +12,10 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      TARGET: aarch64-linux-musl
+      ZIG_VERSION: 0.13.0
       OPENSSL_VERSION: 3.2.2
       ZLIB_VERSION: 1.3.1
+      TARGET_TRIPLE: aarch64-linux-musl
 
     steps:
       - name: Checkout
@@ -34,26 +33,27 @@ jobs:
             xz-utils \
             file \
             pkg-config \
-            ca-certificates
+            ca-certificates \
+            qemu-user
 
-      - name: Install musl cross toolchain
+      - name: Install Zig
         run: |
-          wget -q https://musl.cc/${TARGET}-cross.tgz
-          tar -xzf ${TARGET}-cross.tgz
-          echo "${GITHUB_WORKSPACE}/${TARGET}-cross/bin" >> "${GITHUB_PATH}"
+          wget -q https://ziglang.org/download/${ZIG_VERSION}/zig-linux-x86_64-${ZIG_VERSION}.tar.xz
+          tar -xf zig-linux-x86_64-${ZIG_VERSION}.tar.xz
+          echo "${GITHUB_WORKSPACE}/zig-linux-x86_64-${ZIG_VERSION}" >> "${GITHUB_PATH}"
 
-      - name: Show toolchain
-        run: |
-          ${TARGET}-gcc -v
-          ${TARGET}-ar --version
-          ${TARGET}-ranlib --version
+      - name: Show Zig version
+        run: zig version
 
       - name: Build zlib (static)
         run: |
           wget -q https://zlib.net/zlib-${ZLIB_VERSION}.tar.gz
           tar -xzf zlib-${ZLIB_VERSION}.tar.gz
           cd zlib-${ZLIB_VERSION}
-          CHOST=${TARGET} CC=${TARGET}-gcc AR=${TARGET}-ar RANLIB=${TARGET}-ranlib ./configure --static --prefix="${GITHUB_WORKSPACE}/deps"
+          export CC="zig cc -target ${TARGET_TRIPLE}"
+          export AR="zig ar"
+          export RANLIB="zig ranlib"
+          CHOST=${TARGET_TRIPLE} ./configure --static --prefix="${GITHUB_WORKSPACE}/deps"
           make -j"$(nproc)"
           make install
 
@@ -62,7 +62,9 @@ jobs:
           wget -q https://www.openssl.org/source/openssl-${OPENSSL_VERSION}.tar.gz
           tar -xzf openssl-${OPENSSL_VERSION}.tar.gz
           cd openssl-${OPENSSL_VERSION}
-          CC=${TARGET}-gcc AR="${TARGET}-ar" RANLIB="${TARGET}-ranlib" \
+          export CC="zig cc -target ${TARGET_TRIPLE}"
+          export AR="zig ar"
+          export RANLIB="zig ranlib"
           ./Configure linux-aarch64 no-shared no-tests no-module no-dso \
             --prefix="${GITHUB_WORKSPACE}/deps"
           make -j"$(nproc)"
@@ -79,11 +81,7 @@ jobs:
           s = p.read_text()
 
           s = s.replace("HOST_ARCH := $(shell arch)", "HOST_ARCH ?= aarch64")
-
-          s = s.replace(
-              "LDFLAGS := $(COMMON_LDFLAGS)",
-              "LDFLAGS ?= $(COMMON_LDFLAGS)"
-          )
+          s = s.replace("LDFLAGS := $(COMMON_LDFLAGS)", "LDFLAGS ?= $(COMMON_LDFLAGS)")
 
           if "CFLAGS ?=" not in s:
               s = s.replace(
@@ -94,20 +92,20 @@ jobs:
           p.write_text(s)
           PY
 
-          echo "==== Makefile diff ===="
           diff -u Makefile.orig Makefile || true
 
-      - name: Build MTProxy (static musl)
+      - name: Build MTProxy
         shell: bash
         run: |
           make clean || true
 
           export HOST_ARCH=aarch64
-          export CC=${TARGET}-gcc
-          export AR=${TARGET}-ar
-          export RANLIB=${TARGET}-ranlib
+          export CC="zig cc -target ${TARGET_TRIPLE}"
+          export CXX="zig c++ -target ${TARGET_TRIPLE}"
+          export AR="zig ar"
+          export RANLIB="zig ranlib"
 
-          export CFLAGS="-O2 -static -pipe \
+          export CFLAGS="-O2 -pipe -static \
             -I${GITHUB_WORKSPACE}/deps/include \
             -fno-strict-aliasing -fno-strict-overflow -fwrapv \
             -DAES=1 -D_GNU_SOURCE=1 -D_FILE_OFFSET_BITS=64 \
@@ -119,7 +117,6 @@ jobs:
             -Wl,--start-group -lcrypto -lz -lpthread -lm -lrt -Wl,--end-group"
 
           echo "CC=$CC"
-          echo "AR=$AR"
           echo "HOST_ARCH=$HOST_ARCH"
           echo "CFLAGS=$CFLAGS"
           echo "LDFLAGS=$LDFLAGS"
@@ -129,19 +126,15 @@ jobs:
       - name: Inspect binary
         if: always()
         run: |
-          set -x
           ls -lah objs/bin || true
           file objs/bin/mtproto-proxy || true
           readelf -h objs/bin/mtproto-proxy || true
           readelf -d objs/bin/mtproto-proxy || true
-          ${TARGET}-readelf -A objs/bin/mtproto-proxy || true
           strings objs/bin/mtproto-proxy | grep -Ei 'musl|glibc|openssl|zlib' | head -n 50 || true
 
-      - name: Smoke check help output under qemu
+      - name: Smoke check under qemu
         if: always()
         run: |
-          sudo apt-get update
-          sudo apt-get install -y qemu-user
           qemu-aarch64 ./objs/bin/mtproto-proxy --help | head -n 40 || true
 
       - name: Upload binary
@@ -151,7 +144,7 @@ jobs:
           name: mtproto-proxy-aarch64-musl
           path: objs/bin/mtproto-proxy
 
-      - name: Upload logs and patched Makefile
+      - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
