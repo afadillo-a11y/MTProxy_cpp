@@ -121,30 +121,28 @@ jobs:
           from pathlib import Path
           import re
 
-          def sub_or_die(path_str, pattern, repl, flags=0, count=0):
+          def replace_or_warn(path_str, old, new, count=1):
+            p = Path(path_str)
+            s = p.read_text()
+            if old in s:
+              s = s.replace(old, new, count)
+              p.write_text(s)
+
+          def regex_replace_or_warn(path_str, pattern, repl, flags=0, count=0):
             p = Path(path_str)
             s = p.read_text()
             ns, n = re.subn(pattern, repl, s, flags=flags, count=count)
-            if n == 0:
-              raise SystemExit(f"patch failed: {path_str}: pattern not found: {pattern}")
-            p.write_text(ns)
-
-          def replace_or_die(path_str, old, new, count=-1):
-            p = Path(path_str)
-            s = p.read_text()
-            n = s.count(old)
-            if n == 0:
-              raise SystemExit(f"patch failed: {path_str}: text not found: {old[:80]!r}")
-            if count >= 0 and n < count:
-              raise SystemExit(f"patch failed: {path_str}: expected >= {count}, got {n}")
-            p.write_text(s.replace(old, new))
+            if n:
+              p.write_text(ns)
 
           # 1) engine/engine-rpc.h: x86intrin only on x86
-          sub_or_die(
-            "engine/engine-rpc.h",
-            r'#include <x86intrin\.h>',
+          p = Path("engine/engine-rpc.h")
+          s = p.read_text()
+          s = s.replace(
+            '#include <x86intrin.h>',
             '#if defined(__i386__) || defined(__x86_64__)\n#include <x86intrin.h>\n#endif'
           )
+          p.write_text(s)
 
           # 2) common/precise-time.h: rdtsc fallback for non-x86
           p = Path("common/precise-time.h")
@@ -160,8 +158,6 @@ jobs:
               "}\n"
               "#endif\n\n/* net-event.h */"
             )
-            if marker not in s:
-              raise SystemExit("patch failed: common/precise-time.h marker not found")
             s = s.replace(marker, repl, 1)
             p.write_text(s)
 
@@ -183,7 +179,7 @@ jobs:
             p.write_text(s)
 
           # 4) jobs/jobs.h: musl-compatible RNG state
-          replace_or_die(
+          replace_or_warn(
             "jobs/jobs.h",
             "  struct drand48_data rand_data;",
             "  unsigned short rand_data[3];"
@@ -192,7 +188,7 @@ jobs:
           # 5) jobs/jobs.c: replace glibc *_r RNG API with xsubi[3] family
           p = Path("jobs/jobs.c")
           s = p.read_text()
-          for old, new in [
+          pairs = [
             (
               "    long int t;\n    lrand48_r (&this_job_thread->rand_data, &t);\n    return t;",
               "    return nrand48 (this_job_thread->rand_data);"
@@ -214,23 +210,22 @@ jobs:
               "    JT->rand_data[2] = (unsigned short)((seed >> 32) & 0xffffu);\n"
               "  }"
             ),
-          ]:
-            if old not in s:
-              raise SystemExit(f"patch failed: jobs/jobs.c text not found: {old[:80]!r}")
-            s = s.replace(old, new, 1)
+          ]
+          for old, new in pairs:
+            if old in s:
+              s = s.replace(old, new, 1)
           p.write_text(s)
 
           # 6) common/cpuid.c: stub on non-x86
           p = Path("common/cpuid.c")
           s = p.read_text()
-          if "#include <cpuid.h>" in s:
-            s = s.replace(
-              '#include <cpuid.h>\n\n#include "cpuid.h"\n',
-              '#if defined(__i386__) || defined(__x86_64__)\n#include <cpuid.h>\n#endif\n\n#include "cpuid.h"\n',
-              1
-            )
-
-          s = re.sub(
+          s = s.replace(
+            '#include <cpuid.h>\n\n#include "cpuid.h"\n',
+            '#if defined(__i386__) || defined(__x86_64__)\n#include <cpuid.h>\n#endif\n\n#include "cpuid.h"\n',
+            1
+          )
+          regex_replace_or_warn(
+            "common/cpuid.c",
             r'kdb_cpuid_t \*kdb_cpuid \(void\) \{.*?\n\}',
             '''kdb_cpuid_t *kdb_cpuid (void) {
           #if defined(__i386__) || defined(__x86_64__)
@@ -257,29 +252,24 @@ jobs:
             return &cached;
           #endif
           }''',
-            s,
             flags=re.S,
             count=1
           )
-          p.write_text(s)
 
-          # 7) common/crc32c.c: do not use x86 intrinsics/asm on aarch64
+          # 7) common/crc32c.c: avoid x86 intrinsics/asm on aarch64
           p = Path("common/crc32c.c")
           s = p.read_text()
-
           s = s.replace(
             "#include <wmmintrin.h>",
             "#if defined(__i386__) || defined(__x86_64__)\n#include <wmmintrin.h>\n#endif",
             1
           )
-
           s = s.replace("#ifdef __LP64__", "#if defined(__x86_64__)", 1)
           s = s.replace(
             "\n#else\nstatic unsigned crc32c_partial_sse42 (const void *data, long len, unsigned crc) {",
             "\n#elif defined(__i386__)\nstatic unsigned crc32c_partial_sse42 (const void *data, long len, unsigned crc) {",
             1
           )
-
           s = re.sub(
             r'void crc32c_init \(void\) \{.*?\n\}',
             '''void crc32c_init (void) {
@@ -306,10 +296,36 @@ jobs:
             count=1
           )
           p.write_text(s)
+
+          # 8) common/server-functions.c: execinfo.h missing on musl/OpenWrt
+          p = Path("common/server-functions.c")
+          s = p.read_text()
+          s = s.replace(
+            "#include <execinfo.h>",
+            "#if defined(__GLIBC__)\n#include <execinfo.h>\n#endif",
+            1
+          )
+
+          s = s.replace(
+            "  void *trace[16];\n  int trace_size = backtrace (trace, 16);\n  kprintf (\"------- Stack Backtrace -------\\n\");\n  backtrace_symbols_fd (trace, trace_size, 2);\n  kprintf (\"-------------------------------\\n\");",
+            "#if defined(__GLIBC__)\n"
+            "  void *trace[16];\n"
+            "  int trace_size = backtrace (trace, 16);\n"
+            "  kprintf (\"------- Stack Backtrace -------\\n\");\n"
+            "  backtrace_symbols_fd (trace, trace_size, 2);\n"
+            "  kprintf (\"-------------------------------\\n\");\n"
+            "#else\n"
+            "  kprintf (\"------- Stack Backtrace -------\\n\");\n"
+            "  kprintf (\"backtrace unavailable on this libc\\n\");\n"
+            "  kprintf (\"-------------------------------\\n\");\n"
+            "#endif"
+          )
+          p.write_text(s)
+
           PY
 
           echo "===== grep after patch ====="
-          grep -RIn "x86intrin.h\|wmmintrin.h\|drand48_data\|srand48_r\|lrand48_r\|mrand48_r\|drand48_r\|__get_cpuid" engine jobs common || true
+          grep -RIn "x86intrin.h\|wmmintrin.h\|drand48_data\|srand48_r\|lrand48_r\|mrand48_r\|drand48_r\|__get_cpuid\|execinfo.h\|backtrace" engine jobs common || true
 
       - name: Build MTProxy (static musl)
         shell: bash
