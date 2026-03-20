@@ -133,13 +133,11 @@ jobs:
               if not p.exists(): return
               code = p.read_text(encoding='utf-8')
               
-              # Инжектим заглушки x86 SIMD типов для AArch64
               inject = "#if !defined(__i386__) && !defined(__x86_64__)\ntypedef long long v2di __attribute__((vector_size(16)));\ntypedef char v16qi __attribute__((vector_size(16)));\ntypedef int v4si __attribute__((vector_size(16)));\n#endif\n"
               if "typedef long long v2di" not in code:
                   code = inject + code
               
               for name in func_names:
-                  # Ищем сигнатуру целевой функции и открывающую скобку
                   pattern = r'^[ \t]*([a-zA-Z0-9_ \*]+\s+)?' + name + r'\s*\(.*?\)\s*\{'
                   sig_match = re.search(pattern, code, re.MULTILINE)
                   if not sig_match: continue
@@ -147,7 +145,6 @@ jobs:
                   start_idx = sig_match.start()
                   brace_idx = sig_match.end() - 1
                   
-                  # Парсим вложенные скобки, чтобы закрыть функцию в правильном месте
                   count = 1
                   idx = brace_idx + 1
                   while count > 0 and idx < len(code):
@@ -162,9 +159,9 @@ jobs:
                       
               p.write_text(code, encoding='utf-8')
 
-          # 1) engine/engine-rpc.h
+          # 1) engine/engine-rpc.h (ДОБАВЛЕН ФОЛБЭК ДЛЯ __rdtsc)
           patch_file("engine/engine-rpc.h", [
-              (r'#include\s+<x86intrin\.h>', '#if defined(__i386__) || defined(__x86_64__)\n#include <x86intrin.h>\n#endif')
+              (r'#include\s+<x86intrin\.h>', '#if defined(__i386__) || defined(__x86_64__)\n#include <x86intrin.h>\n#else\n#include "common/precise-time.h"\n#define __rdtsc rdtsc\n#endif')
           ])
 
           # 2) common/precise-time.h
@@ -195,7 +192,6 @@ jobs:
           ])
 
           # 6) common/crc32.c and common/crc32c.c
-          # Блокируем функции со специфичными x86/SSE инструкциями
           wrap_x86_functions("common/crc32.c", [
               "crcXX_partial_clmul",
               "crc32_partial_clmul",
