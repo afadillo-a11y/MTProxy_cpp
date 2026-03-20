@@ -128,6 +128,13 @@ jobs:
                   content = re.sub(pattern, lambda _, r=repl: r, content, flags=re.DOTALL | re.MULTILINE)
               p.write_text(content, encoding='utf-8')
 
+          def append_to_file(path, text):
+              p = Path(path)
+              if p.exists():
+                  content = p.read_text(encoding='utf-8')
+                  if "__rdtsc(void)" not in content:
+                      p.write_text(content + text, encoding='utf-8')
+
           def wrap_x86_functions(path, func_names):
               p = Path(path)
               if not p.exists(): return
@@ -159,15 +166,17 @@ jobs:
                       
               p.write_text(code, encoding='utf-8')
 
-          # 1) engine/engine-rpc.h (ДОБАВЛЕН ФОЛБЭК ДЛЯ __rdtsc)
+          # 1) engine/engine-rpc.h
           patch_file("engine/engine-rpc.h", [
-              (r'#include\s+<x86intrin\.h>', '#if defined(__i386__) || defined(__x86_64__)\n#include <x86intrin.h>\n#else\n#include "common/precise-time.h"\n#define __rdtsc rdtsc\n#endif')
+              (r'#include\s+<x86intrin\.h>', '#if defined(__i386__) || defined(__x86_64__)\n#include <x86intrin.h>\n#endif')
           ])
 
-          # 2) common/precise-time.h
+          # 2) common/precise-time.h & precise-time.c (Fixes undefined symbol: __rdtsc)
           patch_file("common/precise-time.h", [
               (r'#endif\s*/\*\s*net-event\.h\s*\*/', '#else\nstatic __inline__ unsigned long long rdtsc(void) {\n  struct timespec ts;\n  clock_gettime(CLOCK_MONOTONIC_RAW, &ts);\n  return (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec;\n}\n#endif\n/* net-event.h */')
           ])
+          
+          append_to_file("common/precise-time.c", "\n#if !defined(__i386__) && !defined(__x86_64__)\nunsigned long long __rdtsc(void) {\n  struct timespec ts;\n  clock_gettime(CLOCK_MONOTONIC_RAW, &ts);\n  return (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec;\n}\n#endif\n")
 
           # 3) common/server-functions.h
           patch_file("common/server-functions.h", [
