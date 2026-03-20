@@ -125,8 +125,42 @@ jobs:
               if not p.exists(): return
               content = p.read_text(encoding='utf-8')
               for pattern, repl in patches:
-                  content = re.sub(pattern, lambda _, r=repl: r, content, flags=re.DOTALL)
+                  content = re.sub(pattern, lambda _, r=repl: r, content, flags=re.DOTALL | re.MULTILINE)
               p.write_text(content, encoding='utf-8')
+
+          def wrap_x86_functions(path, func_names):
+              p = Path(path)
+              if not p.exists(): return
+              code = p.read_text(encoding='utf-8')
+              
+              # Инжектим заглушки x86 SIMD типов для AArch64
+              inject = "#if !defined(__i386__) && !defined(__x86_64__)\ntypedef long long v2di __attribute__((vector_size(16)));\ntypedef char v16qi __attribute__((vector_size(16)));\ntypedef int v4si __attribute__((vector_size(16)));\n#endif\n"
+              if "typedef long long v2di" not in code:
+                  code = inject + code
+              
+              for name in func_names:
+                  # Ищем сигнатуру целевой функции и открывающую скобку
+                  pattern = r'^[ \t]*([a-zA-Z0-9_ \*]+\s+)?' + name + r'\s*\(.*?\)\s*\{'
+                  sig_match = re.search(pattern, code, re.MULTILINE)
+                  if not sig_match: continue
+                  
+                  start_idx = sig_match.start()
+                  brace_idx = sig_match.end() - 1
+                  
+                  # Парсим вложенные скобки, чтобы закрыть функцию в правильном месте
+                  count = 1
+                  idx = brace_idx + 1
+                  while count > 0 and idx < len(code):
+                      if code[idx] == '{': count += 1
+                      elif code[idx] == '}': count -= 1
+                      idx += 1
+                      
+                  if count == 0:
+                      func_code = code[start_idx:idx]
+                      wrapped = "#if defined(__i386__) || defined(__x86_64__)\n" + func_code + "\n#endif\n"
+                      code = code[:start_idx] + wrapped + code[idx:]
+                      
+              p.write_text(code, encoding='utf-8')
 
           # 1) engine/engine-rpc.h
           patch_file("engine/engine-rpc.h", [
@@ -160,11 +194,30 @@ jobs:
               (r'kdb_cpuid_t\s*\*kdb_cpuid\s*\(void\)\s*\{.*', 'kdb_cpuid_t *kdb_cpuid (void) {\n#if defined(__i386__) || defined(__x86_64__)\n  static kdb_cpuid_t cached = { .magic = 0 };\n  if (cached.magic) {\n    assert (cached.magic == CPUID_MAGIC);\n    return &cached;\n  }\n  unsigned int a;\n  assert(__get_cpuid(1, &a, (unsigned int*) &cached.ebx, (unsigned int*) &cached.ecx, (unsigned int*) &cached.edx) != 0);\n  cached.magic = CPUID_MAGIC;\n  return &cached;\n#else\n  static kdb_cpuid_t cached = { .magic = 0x280147b8, .ebx = 0, .ecx = 0, .edx = 0 };\n  return &cached;\n#endif\n}')
           ])
 
-          # 6) common/crc32c.c and common/crc32.c
+          # 6) common/crc32.c and common/crc32c.c
+          # Блокируем функции со специфичными x86/SSE инструкциями
+          wrap_x86_functions("common/crc32.c", [
+              "crcXX_partial_clmul",
+              "crc32_partial_clmul",
+              "crc64_barrett_reduction",
+              "crc64_partial_clmul",
+              "gf32_compute_powers_clmul",
+              "gf32_combine_clmul",
+              "compute_crc32_combine_clmul",
+              "compute_crc64_combine_clmul"
+          ])
+          
+          wrap_x86_functions("common/crc32c.c", [
+              "crc32c_partial_sse42",
+              "crc32c_partial_sse42_clmul",
+              "crc32c_combine_clmul",
+              "compute_crc32c_combine_clmul",
+              "crc32c_combine_sse42",
+              "compute_crc32c_combine_sse42"
+          ])
+
           patch_file("common/crc32c.c", [
               (r'#include\s+<wmmintrin\.h>', '#if defined(__i386__) || defined(__x86_64__)\n#include <wmmintrin.h>\n#endif'),
-              (r'#ifdef\s+__LP64__', '#if defined(__x86_64__)'),
-              (r'#else\s*static\s+unsigned\s+crc32c_partial_sse42', '#elif defined(__i386__)\nstatic unsigned crc32c_partial_sse42'),
               (r'void\s+crc32c_init\s*\(void\)\s*\{.*', 'void crc32c_init (void) {\n  compute_crc32c_combine = &crc32c_combine_generic;\n#if defined(__i386__) || defined(__x86_64__)\n  kdb_cpuid_t *p = kdb_cpuid ();\n  if (p->ecx & (1 << 20)) {\n    crc32c_partial = crc32c_partial_sse42;\n  #ifdef __x86_64__\n    if (p->ecx & 2) {\n      crc32c_partial = crc32c_partial_sse42_clmul;\n      compute_crc32c_combine = &crc32c_combine_clmul;\n    }\n  #endif\n  } else {\n    crc32c_partial = &crc32c_partial_four_tables;\n  }\n#else\n  crc32c_partial = &crc32c_partial_four_tables;\n#endif\n}')
           ])
           
