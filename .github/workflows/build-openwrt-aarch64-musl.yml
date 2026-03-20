@@ -124,8 +124,9 @@ jobs:
               p = Path(path)
               if not p.exists(): return
               content = p.read_text(encoding='utf-8')
+              # Используем re.DOTALL чтобы символ '.' захватывал и переносы строк
               for pattern, repl in patches:
-                  content = re.sub(pattern, repl, content, flags=re.DOTALL | re.MULTILINE)
+                  content = re.sub(pattern, repl, content, flags=re.DOTALL)
               p.write_text(content, encoding='utf-8')
 
           # 1) engine/engine-rpc.h
@@ -154,23 +155,23 @@ jobs:
               (r'srand48_r\s*\([^;]+;', '{\n  unsigned long long seed = (unsigned long long)rdtsc() ^ (unsigned long long)lrand48();\n  JT->rand_data[0] = (unsigned short)(seed & 0xffffu);\n  JT->rand_data[1] = (unsigned short)((seed >> 16) & 0xffffu);\n  JT->rand_data[2] = (unsigned short)((seed >> 32) & 0xffffu);\n}')
           ])
 
-          # 5) common/cpuid.c (The main culprit)
+          # 5) common/cpuid.c
           patch_file("common/cpuid.c", [
               (r'#include\s+<cpuid\.h>', '#if defined(__i386__) || defined(__x86_64__)\n#include <cpuid.h>\n#endif'),
               (r'kdb_cpuid_t\s*\*kdb_cpuid\s*\(void\)\s*\{.*?return\s*&cached;\s*\}', 'kdb_cpuid_t *kdb_cpuid (void) {\n#if defined(__i386__) || defined(__x86_64__)\n  static kdb_cpuid_t cached = { .magic = 0 };\n  if (cached.magic) {\n    assert (cached.magic == CPUID_MAGIC);\n    return &cached;\n  }\n  unsigned int a;\n  assert(__get_cpuid(1, &a, (unsigned int*) &cached.ebx, (unsigned int*) &cached.ecx, (unsigned int*) &cached.edx) != 0);\n  cached.magic = CPUID_MAGIC;\n  return &cached;\n#else\n  static kdb_cpuid_t cached = { .magic = 0x280147b8, .ebx = 0, .ecx = 0, .edx = 0 };\n  return &cached;\n#endif\n}')
           ])
 
-          # 6) common/crc32c.c and common/crc32.c
+          # 6) common/crc32c.c and common/crc32.c (Используем .* чтобы безопасно затереть все до конца файла)
           patch_file("common/crc32c.c", [
               (r'#include\s+<wmmintrin\.h>', '#if defined(__i386__) || defined(__x86_64__)\n#include <wmmintrin.h>\n#endif'),
               (r'#ifdef\s+__LP64__', '#if defined(__x86_64__)'),
               (r'#else\s*static\s+unsigned\s+crc32c_partial_sse42', '#elif defined(__i386__)\nstatic unsigned crc32c_partial_sse42'),
-              (r'void\s+crc32c_init\s*\(void\)\s*\{.*?\}', 'void crc32c_init (void) {\n  compute_crc32c_combine = &crc32c_combine_generic;\n#if defined(__i386__) || defined(__x86_64__)\n  kdb_cpuid_t *p = kdb_cpuid ();\n  if (p->ecx & (1 << 20)) {\n    crc32c_partial = crc32c_partial_sse42;\n  #ifdef __x86_64__\n    if (p->ecx & 2) {\n      crc32c_partial = crc32c_partial_sse42_clmul;\n      compute_crc32c_combine = &crc32c_combine_clmul;\n    }\n  #endif\n  } else {\n    crc32c_partial = &crc32c_partial_four_tables;\n  }\n#else\n  crc32c_partial = &crc32c_partial_four_tables;\n#endif\n}')
+              (r'void\s+crc32c_init\s*\(void\)\s*\{.*', 'void crc32c_init (void) {\n  compute_crc32c_combine = &crc32c_combine_generic;\n#if defined(__i386__) || defined(__x86_64__)\n  kdb_cpuid_t *p = kdb_cpuid ();\n  if (p->ecx & (1 << 20)) {\n    crc32c_partial = crc32c_partial_sse42;\n  #ifdef __x86_64__\n    if (p->ecx & 2) {\n      crc32c_partial = crc32c_partial_sse42_clmul;\n      compute_crc32c_combine = &crc32c_combine_clmul;\n    }\n  #endif\n  } else {\n    crc32c_partial = &crc32c_partial_four_tables;\n  }\n#else\n  crc32c_partial = &crc32c_partial_four_tables;\n#endif\n}')
           ])
           
           patch_file("common/crc32.c", [
               (r'#include\s+<wmmintrin\.h>', '#if defined(__i386__) || defined(__x86_64__)\n#include <wmmintrin.h>\n#endif'),
-              (r'void\s+crc32_init\s*\(void\)\s*\{.*?\}', 'void crc32_init (void) {\n#if defined(__i386__) || defined(__x86_64__)\n  kdb_cpuid_t *p = kdb_cpuid ();\n  if (p->ecx & 2) {\n    crc32_partial = crc32_partial_clmul;\n    crc64_partial = crc64_partial_clmul;\n    compute_crc32_combine = compute_crc32_combine_clmul;\n    compute_crc64_combine = compute_crc64_combine_clmul;\n  } else {\n    crc32_partial = crc32_partial_generic;\n    crc64_partial = crc64_partial_one_table;\n    compute_crc32_combine = compute_crc32_combine_generic;\n    compute_crc64_combine = compute_crc64_combine_generic;\n  }\n#else\n  crc32_partial = crc32_partial_generic;\n  crc64_partial = crc64_partial_one_table;\n  compute_crc32_combine = compute_crc32_combine_generic;\n  compute_crc64_combine = compute_crc64_combine_generic;\n#endif\n}')
+              (r'void\s+crc32_init\s*\(void\)\s*\{.*', 'void crc32_init (void) {\n#if defined(__i386__) || defined(__x86_64__)\n  kdb_cpuid_t *p = kdb_cpuid ();\n  if (p->ecx & 2) {\n    crc32_partial = crc32_partial_clmul;\n    crc64_partial = crc64_partial_clmul;\n    compute_crc32_combine = compute_crc32_combine_clmul;\n    compute_crc64_combine = compute_crc64_combine_clmul;\n  } else {\n    crc32_partial = crc32_partial_generic;\n    crc64_partial = crc64_partial_one_table;\n    compute_crc32_combine = compute_crc32_combine_generic;\n    compute_crc64_combine = compute_crc64_combine_generic;\n  }\n#else\n  crc32_partial = crc32_partial_generic;\n  crc64_partial = crc64_partial_one_table;\n  compute_crc32_combine = compute_crc32_combine_generic;\n  compute_crc64_combine = compute_crc64_combine_generic;\n#endif\n}')
           ])
 
           # 7) common/server-functions.c
