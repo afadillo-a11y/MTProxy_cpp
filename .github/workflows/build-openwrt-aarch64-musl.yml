@@ -120,6 +120,7 @@ jobs:
         run: |
           python3 - <<'PY'
           import re
+          import subprocess
           from pathlib import Path
 
           def patch_file(path, patches):
@@ -258,8 +259,18 @@ jobs:
           ])
 
           # 8) Делаем красивую строку версии: оставляем только тег и время сборки
+          try:
+              tag_version = subprocess.check_output(['git', 'describe', '--tags', '--abbrev=0'], stderr=subprocess.DEVNULL).decode().strip()
+          except Exception:
+              tag_version = "v3.0.12"
+
+          version_func = f'const char *get_version_string (void) {{\n  return "mtproxy-{tag_version} compiled at " __DATE__ " " __TIME__;\n}}'
+
           patch_file("mtproto/mtproto-proxy.c", [
-              (r'return\s+"mtproxy-"\s*STR\(VERSION\).*?;', 'return "mtproxy-" STR(VERSION) " compiled at " __DATE__ " " __TIME__;')
+              (r'const\s+char\s*\*get_version_string\s*\(void\)\s*\{.*?\}', version_func)
+          ])
+          patch_file("common/server-functions.c", [
+              (r'const\s+char\s*\*get_version_string\s*\(void\)\s*\{.*?\}', version_func)
           ])
           PY
 
@@ -285,17 +296,12 @@ jobs:
             -L${GITHUB_WORKSPACE}/deps/lib64 \
             -Wl,--start-group -lcrypto -lz -lpthread -lm -lrt -Wl,--end-group"
 
-          # Вытягиваем последний актуальный тег (например, v3.0.12)
-          export TAG_VERSION=$(git describe --tags --abbrev=0 2>/dev/null || echo "v3.0.12")
-
           echo "HOST_ARCH=${HOST_ARCH}"
           echo "CC=${CC}"
           echo "CFLAGS=${CFLAGS}"
           echo "LDFLAGS=${LDFLAGS}"
-          echo "VERSION=${TAG_VERSION}"
 
-          # Передаем чистый тег в макрос VERSION
-          make V=1 VERSION="${TAG_VERSION}" 2>&1 | tee build.log
+          make V=1 2>&1 | tee build.log
 
       - name: Inspect binary
         if: always()
