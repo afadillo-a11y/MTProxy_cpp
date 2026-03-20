@@ -99,7 +99,7 @@ jobs:
       - name: Patch Makefile for cross-build
         shell: bash
         run: |
-          # Жестко прописываем тег в Makefile
+          # 1) Жестко прописываем версию прямо в Makefile
           sed -i 's/VERSION :=.*/VERSION := v3.0.12/g' Makefile
           sed -i 's/COMMIT :=.*/COMMIT := v3.0.12/g' Makefile
           cp Makefile Makefile.orig
@@ -127,95 +127,19 @@ jobs:
               if not p.exists(): return
               content = p.read_text(encoding='utf-8')
               for pattern, repl in patches:
-                  content = re.sub(pattern, lambda _, r=repl: r, content, flags=re.DOTALL | re.MULTILINE)
+                  content = re.sub(pattern, lambda _, r=repl: r, content, flags=re.DOTALL)
               p.write_text(content, encoding='utf-8')
 
-          def append_to_file(path, text):
-              p = Path(path)
-              if p.exists():
-                  content = p.read_text(encoding='utf-8')
-                  if "__rdtsc(void)" not in content:
-                      p.write_text(content + text, encoding='utf-8')
-
-          def wrap_x86_functions(path, func_names):
-              p = Path(path)
-              if not p.exists(): return
-              code = p.read_text(encoding='utf-8')
-              
-              inject = "#if !defined(__i386__) && !defined(__x86_64__)\ntypedef long long v2di __attribute__((vector_size(16)));\ntypedef char v16qi __attribute__((vector_size(16)));\ntypedef int v4si __attribute__((vector_size(16)));\n#endif\n"
-              if "typedef long long v2di" not in code:
-                  code = inject + code
-              
-              for name in func_names:
-                  pattern = r'^[ \t]*([a-zA-Z0-9_ \*]+\s+)?' + name + r'\s*\(.*?\)\s*\{'
-                  sig_match = re.search(pattern, code, re.MULTILINE)
-                  if not sig_match: continue
-                  
-                  start_idx = sig_match.start()
-                  brace_idx = sig_match.end() - 1
-                  
-                  count = 1
-                  idx = brace_idx + 1
-                  while count > 0 and idx < len(code):
-                      if code[idx] == '{': count += 1
-                      elif code[idx] == '}': count -= 1
-                      idx += 1
-                      
-                  if count == 0:
-                      func_code = code[start_idx:idx]
-                      wrapped = "#if defined(__i386__) || defined(__x86_64__)\n" + func_code + "\n#endif\n"
-                      code = code[:start_idx] + wrapped + code[idx:]
-                      
-              p.write_text(code, encoding='utf-8')
-
-          def rewrite_function(filepath, func_name, replacement):
-              p = Path(filepath)
-              if not p.exists(): return
-              content = p.read_text(encoding='utf-8')
-              search_start = 0
-              while True:
-                  idx = content.find(func_name, search_start)
-                  if idx == -1: break
-                  paren_idx = content.find('(', idx)
-                  brace_start = content.find('{', idx)
-                  semi_idx = content.find(';', idx)
-                  
-                  # Игнорируем объявления функций (заканчиваются точкой с запятой до скобки)
-                  if semi_idx != -1 and semi_idx < brace_start:
-                      search_start = semi_idx + 1
-                      continue
-                      
-                  if brace_start != -1 and paren_idx != -1 and paren_idx < brace_start:
-                      brace_count = 0
-                      brace_end = -1
-                      for i in range(brace_start, len(content)):
-                          if content[i] == '{': brace_count += 1
-                          elif content[i] == '}': 
-                              brace_count -= 1
-                              if brace_count == 0:
-                                  brace_end = i
-                                  break
-                      if brace_end != -1:
-                          line_start = content.rfind('\n', 0, idx)
-                          if line_start == -1: line_start = 0
-                          content = content[:line_start] + '\n' + replacement + '\n' + content[brace_end+1:]
-                          p.write_text(content, encoding='utf-8')
-                          return # Успешно заменили
-                  search_start = idx + len(func_name)
-
-          # --- 1) Радикально вырезаем C-функции бэктрейса и версии на уровне AST ---
+          # 2) Вычищаем мусор из строк вывода во всех исходниках
           for f in Path('.').rglob('*.c'):
-              rewrite_function(str(f), "get_version_string", 'const char *get_version_string(void) { return "mtproxy-v3.0.12"; }')
-              rewrite_function(str(f), "print_backtrace", 'void print_backtrace(void) {}')
+              s = f.read_text(encoding='utf-8')
+              s = re.sub(r'"\s*by gcc\s*"\s*__VERSION__\s*"\s*"', '""', s)
+              s = re.sub(r'#ifdef __LP64__\s*"64-bit"\s*#else\s*"32-bit"\s*#endif', '""', s)
+              s = re.sub(r'"\s*after commit\s*"\s*COMMIT', '""', s)
+              s = re.sub(r'"\s*after commit\s*"\s*STR\(COMMIT\)', '""', s)
+              f.write_text(s, encoding='utf-8')
 
-          # --- 2) Вырезаем хвосты из engine.c ---
-          ep = Path("engine/engine.c")
-          if ep.exists():
-              s = ep.read_text(encoding='utf-8')
-              s = re.sub(r'vkprintf\s*\(\s*0\s*,\s*"Invoking engine.*?,\s*COMMIT\s*\);', 'vkprintf(0, "Invoking engine %s (v3.0.12)\\n", progname);', s, flags=re.DOTALL)
-              ep.write_text(s, encoding='utf-8')
-
-          # --- 3) Стандартные патчи для совместимости x86 -> ARM ---
+          # 3) Обычные патчи для совместимости x86 -> ARM и musl
           patch_file("engine/engine-rpc.h", [
               (r'#include\s+<x86intrin\.h>', '#if defined(__i386__) || defined(__x86_64__)\n#include <x86intrin.h>\n#else\n#include "common/precise-time.h"\n#define __rdtsc rdtsc\n#endif')
           ])
@@ -223,8 +147,6 @@ jobs:
           patch_file("common/precise-time.h", [
               (r'#endif\s*/\*\s*net-event\.h\s*\*/', '#else\nstatic __inline__ unsigned long long rdtsc(void) {\n  struct timespec ts;\n  clock_gettime(CLOCK_MONOTONIC_RAW, &ts);\n  return (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec;\n}\n#endif\n/* net-event.h */')
           ])
-          
-          append_to_file("common/precise-time.c", "\n#if !defined(__i386__) && !defined(__x86_64__)\nunsigned long long __rdtsc(void) {\n  struct timespec ts;\n  clock_gettime(CLOCK_MONOTONIC_RAW, &ts);\n  return (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec;\n}\n#endif\n")
 
           patch_file("common/server-functions.h", [
               (r'static\s+inline\s+void\s+mfence\s*\(\s*void\s*\)\s*\{\s*asm\s+volatile\s*\(\s*"mfence"\s*:\s*:\s*:"memory"\s*\);\s*\}', 'static inline void mfence (void) {\n#if defined(__i386__) || defined(__x86_64__)\n  asm volatile ("mfence": : :"memory");\n#else\n  __sync_synchronize();\n#endif\n}')
@@ -233,6 +155,7 @@ jobs:
           patch_file("jobs/jobs.h", [
               (r'struct\s+drand48_data\s+rand_data;', 'unsigned short rand_data[3];')
           ])
+          
           patch_file("jobs/jobs.c", [
               (r'lrand48_r\s*\([^,]+,\s*&t\);', 'return nrand48(this_job_thread->rand_data);'),
               (r'mrand48_r\s*\([^,]+,\s*&t\);', 'return jrand48(this_job_thread->rand_data);'),
@@ -245,19 +168,10 @@ jobs:
               (r'kdb_cpuid_t\s*\*kdb_cpuid\s*\(void\)\s*\{.*', 'kdb_cpuid_t *kdb_cpuid (void) {\n#if defined(__i386__) || defined(__x86_64__)\n  static kdb_cpuid_t cached = { .magic = 0 };\n  if (cached.magic) {\n    assert (cached.magic == CPUID_MAGIC);\n    return &cached;\n  }\n  unsigned int a;\n  assert(__get_cpuid(1, &a, (unsigned int*) &cached.ebx, (unsigned int*) &cached.ecx, (unsigned int*) &cached.edx) != 0);\n  cached.magic = CPUID_MAGIC;\n  return &cached;\n#else\n  static kdb_cpuid_t cached = { .magic = 0x280147b8, .ebx = 0, .ecx = 0, .edx = 0 };\n  return &cached;\n#endif\n}')
           ])
 
-          wrap_x86_functions("common/crc32.c", [
-              "crcXX_partial_clmul", "crc32_partial_clmul", "crc64_barrett_reduction",
-              "crc64_partial_clmul", "gf32_compute_powers_clmul", "gf32_combine_clmul",
-              "compute_crc32_combine_clmul", "compute_crc64_combine_clmul"
-          ])
-          
-          wrap_x86_functions("common/crc32c.c", [
-              "crc32c_partial_sse42", "crc32c_partial_sse42_clmul", "crc32c_combine_clmul",
-              "compute_crc32c_combine_clmul", "crc32c_combine_sse42", "compute_crc32c_combine_sse42"
-          ])
-
           patch_file("common/crc32c.c", [
               (r'#include\s+<wmmintrin\.h>', '#if defined(__i386__) || defined(__x86_64__)\n#include <wmmintrin.h>\n#endif'),
+              (r'#ifdef\s+__LP64__', '#if defined(__x86_64__)'),
+              (r'#else\s*static\s+unsigned\s+crc32c_partial_sse42', '#elif defined(__i386__)\nstatic unsigned crc32c_partial_sse42'),
               (r'void\s+crc32c_init\s*\(void\)\s*\{.*', 'void crc32c_init (void) {\n  compute_crc32c_combine = &crc32c_combine_generic;\n#if defined(__i386__) || defined(__x86_64__)\n  kdb_cpuid_t *p = kdb_cpuid ();\n  if (p->ecx & (1 << 20)) {\n    crc32c_partial = crc32c_partial_sse42;\n  #ifdef __x86_64__\n    if (p->ecx & 2) {\n      crc32c_partial = crc32c_partial_sse42_clmul;\n      compute_crc32c_combine = &crc32c_combine_clmul;\n    }\n  #endif\n  } else {\n    crc32c_partial = &crc32c_partial_four_tables;\n  }\n#else\n  crc32c_partial = &crc32c_partial_four_tables;\n#endif\n}')
           ])
           
@@ -265,9 +179,11 @@ jobs:
               (r'#include\s+<wmmintrin\.h>', '#if defined(__i386__) || defined(__x86_64__)\n#include <wmmintrin.h>\n#endif'),
               (r'void\s+crc32_init\s*\(void\)\s*\{.*', 'void crc32_init (void) {\n#if defined(__i386__) || defined(__x86_64__)\n  kdb_cpuid_t *p = kdb_cpuid ();\n  if (p->ecx & 2) {\n    crc32_partial = crc32_partial_clmul;\n    crc64_partial = crc64_partial_clmul;\n    compute_crc32_combine = compute_crc32_combine_clmul;\n    compute_crc64_combine = compute_crc64_combine_clmul;\n  } else {\n    crc32_partial = crc32_partial_generic;\n    crc64_partial = crc64_partial_one_table;\n    compute_crc32_combine = compute_crc32_combine_generic;\n    compute_crc64_combine = compute_crc64_combine_generic;\n  }\n#else\n  crc32_partial = crc32_partial_generic;\n  crc64_partial = crc64_partial_one_table;\n  compute_crc32_combine = compute_crc32_combine_generic;\n  compute_crc64_combine = compute_crc64_combine_generic;\n#endif\n}')
           ])
-          
+
+          # 4) Полностью вырезаем тело backtrace
           patch_file("common/server-functions.c", [
-              (r'#include\s+<execinfo\.h>', '#if defined(__GLIBC__)\n#include <execinfo.h>\n#endif')
+              (r'#include\s+<execinfo\.h>', '#if defined(__GLIBC__)\n#include <execinfo.h>\n#endif'),
+              (r'void\s+print_backtrace\s*\(void\)\s*\{.*?\n\}\n*(?=pthread_t\s+debug_main_pthread_id;)', 'void print_backtrace (void) {}\n\n')
           ])
           PY
 
