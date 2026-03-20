@@ -26,7 +26,9 @@ jobs:
           fetch-depth: 0
 
       - name: Install host tools
+        shell: bash
         run: |
+          set -euxo pipefail
           sudo apt-get update
           sudo apt-get install -y \
             build-essential \
@@ -41,44 +43,54 @@ jobs:
             xz-utils
 
       - name: Install Zig
+        shell: bash
         run: |
+          set -euxo pipefail
           curl -fL --retry 5 --retry-delay 3 \
             -o zig.tar.xz \
-            https://ziglang.org/download/${ZIG_VERSION}/zig-linux-x86_64-${ZIG_VERSION}.tar.xz
+            "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-x86_64-${ZIG_VERSION}.tar.xz"
           tar -xf zig.tar.xz
           echo "${GITHUB_WORKSPACE}/zig-linux-x86_64-${ZIG_VERSION}" >> "${GITHUB_PATH}"
 
       - name: Show tool versions
+        shell: bash
         run: |
+          set -euxo pipefail
           zig version
           cc --version || true
           perl -v | head -n 2
 
       - name: Build zlib (static)
+        shell: bash
         run: |
+          set -euxo pipefail
+
           curl -fL --retry 5 --retry-delay 3 \
             -o zlib.tar.gz \
-            https://github.com/madler/zlib/releases/download/v${ZLIB_VERSION}/zlib-${ZLIB_VERSION}.tar.gz
+            "https://github.com/madler/zlib/releases/download/v${ZLIB_VERSION}/zlib-${ZLIB_VERSION}.tar.gz"
           tar -xzf zlib.tar.gz
-          cd zlib-${ZLIB_VERSION}
+          cd "zlib-${ZLIB_VERSION}"
 
           export CC="zig cc -target ${TARGET_TRIPLE}"
           export AR="zig ar"
           export RANLIB="zig ranlib"
 
-          CHOST=${TARGET_TRIPLE} ./configure --static --prefix="${GITHUB_WORKSPACE}/deps"
+          CHOST="${TARGET_TRIPLE}" ./configure --static --prefix="${GITHUB_WORKSPACE}/deps"
           make -j"$(nproc)"
           make install
 
           test -f "${GITHUB_WORKSPACE}/deps/lib/libz.a"
 
       - name: Build OpenSSL (static)
+        shell: bash
         run: |
+          set -euxo pipefail
+
           curl -fL --retry 5 --retry-delay 3 \
             -o openssl.tar.gz \
-            https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz
+            "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz"
           tar -xzf openssl.tar.gz
-          cd openssl-${OPENSSL_VERSION}
+          cd "openssl-${OPENSSL_VERSION}"
 
           export CC="zig cc -target ${TARGET_TRIPLE}"
           export AR="zig ar"
@@ -99,131 +111,285 @@ jobs:
       - name: Patch Makefile for cross-build
         shell: bash
         run: |
-          sed -i 's/VERSION :=.*/VERSION := v3.0.12/g' Makefile
-          sed -i 's/COMMIT :=.*/COMMIT := v3.0.12/g' Makefile
+          set -euxo pipefail
+
+          sed -i 's/VERSION :=.*/VERSION := v3.0.12/g' Makefile || true
+          sed -i 's/COMMIT :=.*/COMMIT := v3.0.12/g' Makefile || true
           cp Makefile Makefile.orig
 
           python3 - <<'PY'
           from pathlib import Path
+
           p = Path("Makefile")
-          if p.exists():
-              s = p.read_text()
-              s = s.replace("HOST_ARCH := $(shell arch)", "HOST_ARCH ?= aarch64")
-              s = s.replace("LDFLAGS := $(COMMON_LDFLAGS)", "LDFLAGS ?= $(COMMON_LDFLAGS)")
-              s = s.replace("CFLAGS := $(COMMON_CFLAGS) $(BITNESS_FLAGS)", "CFLAGS ?= $(COMMON_CFLAGS) $(BITNESS_FLAGS)")
-              p.write_text(s)
+          if not p.exists():
+              raise SystemExit("Makefile not found")
+
+          s = p.read_text()
+
+          s = s.replace("HOST_ARCH := $(shell arch)", "HOST_ARCH ?= aarch64")
+          s = s.replace("LDFLAGS := $(COMMON_LDFLAGS)", "LDFLAGS ?= $(COMMON_LDFLAGS)")
+          s = s.replace("CFLAGS := $(COMMON_CFLAGS) $(BITNESS_FLAGS)", "CFLAGS ?= $(COMMON_CFLAGS) $(BITNESS_FLAGS)")
+          s = s.replace("CXXFLAGS := $(COMMON_CFLAGS) $(BITNESS_FLAGS)", "CXXFLAGS ?= $(COMMON_CFLAGS) $(BITNESS_FLAGS)")
+
+          p.write_text(s)
           PY
 
       - name: Patch sources for aarch64 + musl
         shell: bash
         run: |
+          set -euxo pipefail
+
           python3 - <<'PY'
           import re
           from pathlib import Path
 
-          def patch_file(path, patches):
+          def patch_text(path, fn):
               p = Path(path)
-              if not p.exists(): return
-              content = p.read_text(encoding='utf-8')
-              for pattern, repl in patches:
-                  content = re.sub(pattern, lambda _, r=repl: r, content, flags=re.DOTALL | re.MULTILINE)
-              p.write_text(content, encoding='utf-8')
+              if not p.exists():
+                  return
+              old = p.read_text(encoding="utf-8")
+              new = fn(old)
+              p.write_text(new, encoding="utf-8")
 
-          def append_to_file(path, text):
-              p = Path(path)
-              if p.exists():
-                  content = p.read_text(encoding='utf-8')
-                  if text.strip() not in content:
-                      p.write_text(content + text, encoding='utf-8')
+          def replace_func(src: str, func_name: str, replacement: str) -> str:
+              idx = src.find(func_name)
+              if idx == -1:
+                  return src
 
-          def replace_func(filepath, func_name, new_code):
-              p = Path(filepath)
-              if not p.exists(): return
-              content = p.read_text(encoding='utf-8')
-              search_start = 0
-              while True:
-                  idx = content.find(func_name, search_start)
-                  if idx == -1: break
-                  start_brace = content.find('{', idx)
-                  semi = content.find(';', idx)
-                  if semi != -1 and semi < start_brace:
-                      search_start = semi + 1
-                      continue
-                  if start_brace != -1:
-                      brace_count = 0
-                      end_brace = -1
-                      for i in range(start_brace, len(content)):
-                          if content[i] == '{': brace_count += 1
-                          elif content[i] == '}':
-                              brace_count -= 1
-                              if brace_count == 0:
-                                  end_brace = i
-                                  break
-                      if end_brace != -1:
-                          line_start = content.rfind('\n', 0, idx)
-                          if line_start == -1: line_start = 0
-                          content = content[:line_start] + '\n' + new_code + '\n' + content[end_brace+1:]
-                          p.write_text(content, encoding='utf-8')
-                          return
-                  search_start = idx + len(func_name)
+              start = src.rfind('\n', 0, idx)
+              if start == -1:
+                  start = 0
+              else:
+                  start += 1
 
-          # 1. Избавляемся от мусора в логах (Backtrace и версия)
-          replace_func("common/server-functions.c", "print_backtrace", "void print_backtrace(void) {}")
-          replace_func("common/server-functions.c", "get_version_string", 'const char *get_version_string(void) { return "mtproxy-v3.0.12"; }')
-          
-          patch_file("common/server-functions.c", [(r'#include\s+<execinfo\.h>', '')])
-          
-          patch_file("mtproto/mtproto-proxy.c", [
-              (r'printf\s*\(\s*"%s compiled at.*?COMMIT\s*\);', 'printf ("%s (v3.0.12) compiled at %s %s\\n", progname, __DATE__, __TIME__);')
-          ])
-          patch_file("engine/engine.c", [
-              (r'vkprintf\s*\(\s*0\s*,\s*"Invoking engine.*?COMMIT\s*\);', 'vkprintf (0, "Invoking engine %s (v3.0.12) compiled at %s %s\\n", progname, __DATE__, __TIME__);')
-          ])
+              brace = src.find('{', idx)
+              if brace == -1:
+                  return src
 
-          # 2. Исправляем баг с __LP64__ (Главная причина сбоя crc32.c на AArch64)
-          patch_file("common/crc32.c", [
-              (r'#ifdef\s+__LP64__', '#if defined(__x86_64__)'),
-              (r'#include\s+<wmmintrin\.h>', '#if defined(__i386__) || defined(__x86_64__)\n#include <wmmintrin.h>\n#endif'),
-              (r'void\s+crc32_init\s*\(void\)\s*\{.*', 'void crc32_init (void) {\n#if defined(__i386__) || defined(__x86_64__)\n  kdb_cpuid_t *p = kdb_cpuid ();\n  if (p->ecx & 2) {\n    crc32_partial = crc32_partial_clmul;\n    crc64_partial = crc64_partial_clmul;\n    compute_crc32_combine = compute_crc32_combine_clmul;\n    compute_crc64_combine = compute_crc64_combine_clmul;\n  } else {\n    crc32_partial = crc32_partial_generic;\n    crc64_partial = crc64_partial_one_table;\n    compute_crc32_combine = compute_crc32_combine_generic;\n    compute_crc64_combine = compute_crc64_combine_generic;\n  }\n#else\n  crc32_partial = crc32_partial_generic;\n  crc64_partial = crc64_partial_one_table;\n  compute_crc32_combine = compute_crc32_combine_generic;\n  compute_crc64_combine = compute_crc64_combine_generic;\n#endif\n}')
-          ])
-          
-          patch_file("common/crc32c.c", [
-              (r'#ifdef\s+__LP64__', '#if defined(__x86_64__)'),
-              (r'#else\s*static\s+unsigned\s+crc32c_partial_sse42', '#elif defined(__i386__)\nstatic unsigned crc32c_partial_sse42'),
-              (r'#include\s+<wmmintrin\.h>', '#if defined(__i386__) || defined(__x86_64__)\n#include <wmmintrin.h>\n#endif'),
-              (r'void\s+crc32c_init\s*\(void\)\s*\{.*', 'void crc32c_init (void) {\n  compute_crc32c_combine = &crc32c_combine_generic;\n#if defined(__i386__) || defined(__x86_64__)\n  kdb_cpuid_t *p = kdb_cpuid ();\n  if (p->ecx & (1 << 20)) {\n    crc32c_partial = crc32c_partial_sse42;\n  #ifdef __x86_64__\n    if (p->ecx & 2) {\n      crc32c_partial = crc32c_partial_sse42_clmul;\n      compute_crc32c_combine = &crc32c_combine_clmul;\n    }\n  #endif\n  } else {\n    crc32_partial = &crc32c_partial_four_tables;\n  }\n#else\n  crc32_partial = &crc32c_partial_four_tables;\n#endif\n}')
-          ])
+              depth = 0
+              end = -1
+              for i in range(brace, len(src)):
+                  if src[i] == '{':
+                      depth += 1
+                  elif src[i] == '}':
+                      depth -= 1
+                      if depth == 0:
+                          end = i + 1
+                          break
+              if end == -1:
+                  return src
 
-          # 3. Базовые заглушки для архитектуры ARM / musl
-          patch_file("engine/engine-rpc.h", [
-              (r'#include\s+<x86intrin\.h>', '#if defined(__i386__) || defined(__x86_64__)\n#include <x86intrin.h>\n#else\n#include "common/precise-time.h"\n#define __rdtsc rdtsc\n#endif')
-          ])
-          patch_file("common/precise-time.h", [
-              (r'#endif\s*/\*\s*net-event\.h\s*\*/', '#else\nstatic __inline__ unsigned long long rdtsc(void) {\n  struct timespec ts;\n  clock_gettime(CLOCK_MONOTONIC_RAW, &ts);\n  return (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec;\n}\n#endif\n/* net-event.h */')
-          ])
-          append_to_file("common/precise-time.c", "\n#if !defined(__i386__) && !defined(__x86_64__)\nunsigned long long __rdtsc(void) {\n  struct timespec ts;\n  clock_gettime(CLOCK_MONOTONIC_RAW, &ts);\n  return (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec;\n}\n#endif\n")
+              return src[:start] + replacement.rstrip() + "\n\n" + src[end:]
 
-          patch_file("common/server-functions.h", [
-              (r'static\s+inline\s+void\s+mfence\s*\(\s*void\s*\)\s*\{\s*asm\s+volatile\s*\(\s*"mfence"\s*:\s*:\s*:"memory"\s*\);\s*\}', 'static inline void mfence (void) {\n#if defined(__i386__) || defined(__x86_64__)\n  asm volatile ("mfence": : :"memory");\n#else\n  __sync_synchronize();\n#endif\n}')
-          ])
+          def patch_server_functions(s: str) -> str:
+              s = re.sub(r'^\s*#include\s*<execinfo\.h>\s*$', '', s, flags=re.M)
+              s = replace_func(
+                  s,
+                  "print_backtrace(",
+                  "void print_backtrace(void) {\n}\n"
+              )
+              s = replace_func(
+                  s,
+                  "get_version_string(",
+                  'const char *get_version_string(void) {\n  return "mtproxy-v3.0.12";\n}\n'
+              )
+              return s
 
-          patch_file("jobs/jobs.h", [(r'struct\s+drand48_data\s+rand_data;', 'unsigned short rand_data[3];')])
-          patch_file("jobs/jobs.c", [
-              (r'lrand48_r\s*\([^,]+,\s*&t\);', 'return nrand48(this_job_thread->rand_data);'),
-              (r'mrand48_r\s*\([^,]+,\s*&t\);', 'return jrand48(this_job_thread->rand_data);'),
-              (r'drand48_r\s*\([^,]+,\s*&t\);', 'return erand48(this_job_thread->rand_data);'),
-              (r'srand48_r\s*\([^;]+;', '{\n  unsigned long long seed = (unsigned long long)rdtsc() ^ (unsigned long long)lrand48();\n  JT->rand_data[0] = (unsigned short)(seed & 0xffffu);\n  JT->rand_data[1] = (unsigned short)((seed >> 16) & 0xffffu);\n  JT->rand_data[2] = (unsigned short)((seed >> 32) & 0xffffu);\n}')
-          ])
+          def patch_mtproto_banner(s: str) -> str:
+              return re.sub(
+                  r'printf\s*\(\s*"%s compiled at.*?COMMIT\s*\);',
+                  'printf ("%s (v3.0.12) compiled at %s %s\\n", progname, __DATE__, __TIME__);',
+                  s,
+                  flags=re.S
+              )
 
-          patch_file("common/cpuid.c", [
-              (r'#include\s+<cpuid\.h>', '#if defined(__i386__) || defined(__x86_64__)\n#include <cpuid.h>\n#endif'),
-              (r'kdb_cpuid_t\s*\*kdb_cpuid\s*\(void\)\s*\{.*', 'kdb_cpuid_t *kdb_cpuid (void) {\n#if defined(__i386__) || defined(__x86_64__)\n  static kdb_cpuid_t cached = { .magic = 0 };\n  if (cached.magic) { return &cached; }\n  unsigned int a;\n  __get_cpuid(1, &a, (unsigned int*) &cached.ebx, (unsigned int*) &cached.ecx, (unsigned int*) &cached.edx);\n  cached.magic = 0x280147b8;\n  return &cached;\n#else\n  static kdb_cpuid_t cached = { .magic = 0x280147b8, .ebx = 0, .ecx = 0, .edx = 0 };\n  return &cached;\n#endif\n}')
-          ])
+          def patch_engine_banner(s: str) -> str:
+              return re.sub(
+                  r'vkprintf\s*\(\s*0\s*,\s*"Invoking engine.*?COMMIT\s*\);',
+                  'vkprintf (0, "Invoking engine %s (v3.0.12) compiled at %s %s\\n", progname, __DATE__, __TIME__);',
+                  s,
+                  flags=re.S
+              )
+
+          def patch_precise_time_h(s: str) -> str:
+              if "CLOCK_MONOTONIC_RAW" in s and "__rdtsc rdtsc" in s:
+                  return s
+              s = re.sub(
+                  r'#include\s+<x86intrin\.h>',
+                  '#if defined(__i386__) || defined(__x86_64__)\n#include <x86intrin.h>\n#else\n#include <time.h>\nstatic __inline__ unsigned long long __rdtsc(void) {\n  struct timespec ts;\n  clock_gettime(CLOCK_MONOTONIC_RAW, &ts);\n  return (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec;\n}\n#endif',
+                  s
+              )
+              return s
+
+          def patch_server_functions_h(s: str) -> str:
+              return re.sub(
+                  r'static\s+inline\s+void\s+mfence\s*\(\s*void\s*\)\s*\{\s*asm\s+volatile\s*\(\s*"mfence"\s*:\s*:\s*:"memory"\s*\);\s*\}',
+                  'static inline void mfence (void) {\n#if defined(__i386__) || defined(__x86_64__)\n  asm volatile ("mfence": : : "memory");\n#else\n  __sync_synchronize();\n#endif\n}',
+                  s,
+                  flags=re.S
+              )
+
+          def patch_engine_rpc_h(s: str) -> str:
+              return re.sub(
+                  r'#include\s+<x86intrin\.h>',
+                  '#if defined(__i386__) || defined(__x86_64__)\n#include <x86intrin.h>\n#else\n#include "common/precise-time.h"\n#endif',
+                  s
+              )
+
+          def patch_jobs_h(s: str) -> str:
+              return s.replace('struct drand48_data rand_data;', 'unsigned short rand_data[3];')
+
+          def patch_jobs_c(s: str) -> str:
+              s = re.sub(r'lrand48_r\s*\([^,]+,\s*&t\)\s*;', 'return nrand48(this_job_thread->rand_data);', s)
+              s = re.sub(r'mrand48_r\s*\([^,]+,\s*&t\)\s*;', 'return jrand48(this_job_thread->rand_data);', s)
+              s = re.sub(r'drand48_r\s*\([^,]+,\s*&t\)\s*;', 'return erand48(this_job_thread->rand_data);', s)
+              s = re.sub(
+                  r'srand48_r\s*\([^;]+;',
+                  '{\n  unsigned long long seed = (unsigned long long)__rdtsc() ^ (unsigned long long)lrand48();\n  JT->rand_data[0] = (unsigned short)(seed & 0xffffu);\n  JT->rand_data[1] = (unsigned short)((seed >> 16) & 0xffffu);\n  JT->rand_data[2] = (unsigned short)((seed >> 32) & 0xffffu);\n}',
+                  s
+              )
+              return s
+
+          def patch_cpuid_c(s: str) -> str:
+              s = re.sub(
+                  r'#include\s+<cpuid\.h>',
+                  '#if defined(__i386__) || defined(__x86_64__)\n#include <cpuid.h>\n#endif',
+                  s
+              )
+              s = replace_func(
+                  s,
+                  "kdb_cpuid(",
+                  '''kdb_cpuid_t *kdb_cpuid (void) {
+          #if defined(__i386__) || defined(__x86_64__)
+            static kdb_cpuid_t cached = { .magic = 0 };
+            if (cached.magic) {
+              return &cached;
+            }
+            unsigned int a = 0, b = 0, c = 0, d = 0;
+            __get_cpuid(1, &a, &b, &c, &d);
+            cached.ebx = (int)b;
+            cached.ecx = (int)c;
+            cached.edx = (int)d;
+            cached.magic = 0x280147b8;
+            return &cached;
+          #else
+            static kdb_cpuid_t cached = { .magic = 0x280147b8, .ebx = 0, .ecx = 0, .edx = 0 };
+            return &cached;
+          #endif
+          }'''
+              )
+              return s
+
+          def patch_crc32(s: str) -> str:
+              s = re.sub(
+                  r'#ifdef\s+__LP64__',
+                  '#if defined(__x86_64__)',
+                  s
+              )
+
+              if '#include <wmmintrin.h>' in s and '#if defined(__i386__) || defined(__x86_64__)\n#include <wmmintrin.h>\n#endif' not in s:
+                  s = s.replace(
+                      '#include <wmmintrin.h>',
+                      '#if defined(__i386__) || defined(__x86_64__)\n#include <wmmintrin.h>'
+                  )
+                  marker = 'void crc32_init'
+                  pos = s.find(marker)
+                  if pos != -1:
+                      s = s[:pos] + '#endif\n\n' + s[pos:]
+
+              s = replace_func(
+                  s,
+                  'crc32_init(',
+                  '''void crc32_init (void) {
+          #if defined(__i386__) || defined(__x86_64__)
+            kdb_cpuid_t *p = kdb_cpuid ();
+            if (p->ecx & 2) {
+              crc32_partial = crc32_partial_clmul;
+              crc64_partial = crc64_partial_clmul;
+              compute_crc32_combine = compute_crc32_combine_clmul;
+              compute_crc64_combine = compute_crc64_combine_clmul;
+            } else {
+              crc32_partial = crc32_partial_generic;
+              crc64_partial = crc64_partial_one_table;
+              compute_crc32_combine = compute_crc32_combine_generic;
+              compute_crc64_combine = compute_crc64_combine_generic;
+            }
+          #else
+            crc32_partial = crc32_partial_generic;
+            crc64_partial = crc64_partial_one_table;
+            compute_crc32_combine = compute_crc32_combine_generic;
+            compute_crc64_combine = compute_crc64_combine_generic;
+          #endif
+          }'''
+              )
+              return s
+
+          def patch_crc32c(s: str) -> str:
+              s = re.sub(
+                  r'#ifdef\s+__LP64__',
+                  '#if defined(__x86_64__)',
+                  s
+              )
+              s = re.sub(
+                  r'#else\s*static\s+unsigned\s+crc32c_partial_sse42',
+                  '#elif defined(__i386__)\nstatic unsigned crc32c_partial_sse42',
+                  s,
+                  flags=re.S
+              )
+
+              if '#include <wmmintrin.h>' in s and '#if defined(__i386__) || defined(__x86_64__)\n#include <wmmintrin.h>\n#endif' not in s:
+                  s = s.replace(
+                      '#include <wmmintrin.h>',
+                      '#if defined(__i386__) || defined(__x86_64__)\n#include <wmmintrin.h>'
+                  )
+                  marker = 'void crc32c_init'
+                  pos = s.find(marker)
+                  if pos != -1:
+                      s = s[:pos] + '#endif\n\n' + s[pos:]
+
+              s = replace_func(
+                  s,
+                  'crc32c_init(',
+                  '''void crc32c_init (void) {
+            compute_crc32c_combine = &crc32c_combine_generic;
+          #if defined(__i386__) || defined(__x86_64__)
+            kdb_cpuid_t *p = kdb_cpuid ();
+            if (p->ecx & (1 << 20)) {
+              crc32c_partial = crc32c_partial_sse42;
+            #ifdef __x86_64__
+              if (p->ecx & 2) {
+                crc32c_partial = crc32c_partial_sse42_clmul;
+                compute_crc32c_combine = &crc32c_combine_clmul;
+              }
+            #endif
+            } else {
+              crc32c_partial = &crc32c_partial_four_tables;
+            }
+          #else
+            crc32c_partial = &crc32c_partial_four_tables;
+          #endif
+          }'''
+              )
+              return s
+
+          patch_text("common/server-functions.c", patch_server_functions)
+          patch_text("mtproto/mtproto-proxy.c", patch_mtproto_banner)
+          patch_text("engine/engine.c", patch_engine_banner)
+          patch_text("engine/engine-rpc.h", patch_engine_rpc_h)
+          patch_text("common/precise-time.h", patch_precise_time_h)
+          patch_text("common/server-functions.h", patch_server_functions_h)
+          patch_text("jobs/jobs.h", patch_jobs_h)
+          patch_text("jobs/jobs.c", patch_jobs_c)
+          patch_text("common/cpuid.c", patch_cpuid_c)
+          patch_text("common/crc32.c", patch_crc32)
+          patch_text("common/crc32c.c", patch_crc32c)
           PY
 
       - name: Build MTProxy (static musl)
         shell: bash
         run: |
+          set -euxo pipefail
+
           make clean || true
 
           export HOST_ARCH=aarch64
@@ -234,7 +400,7 @@ jobs:
 
           export CFLAGS="-O2 -pipe -static \
             -I${GITHUB_WORKSPACE}/deps/include \
-            -fno-strict-aliasing -fno-strict-overflow -fwrapv \
+            -fno-strict-aliasing -fwrapv \
             -DAES=1 -D_GNU_SOURCE=1 -D_FILE_OFFSET_BITS=64 \
             -Wno-array-bounds -Wno-implicit-function-declaration"
 
@@ -254,7 +420,7 @@ jobs:
         if: always()
         shell: bash
         run: |
-          set -x
+          set -euxo pipefail
           ls -lah objs/bin || true
           file objs/bin/mtproto-proxy || true
           readelf -h objs/bin/mtproto-proxy || true
@@ -265,6 +431,7 @@ jobs:
         if: always()
         shell: bash
         run: |
+          set -euxo pipefail
           qemu-aarch64 ./objs/bin/mtproto-proxy --help | head -n 60 || true
 
       - name: Upload binary
