@@ -102,13 +102,12 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
           p = Path("Makefile")
-          s = p.read_text()
-
-          s = s.replace("HOST_ARCH := $(shell arch)", "HOST_ARCH ?= aarch64")
-          s = s.replace("LDFLAGS := $(COMMON_LDFLAGS)", "LDFLAGS ?= $(COMMON_LDFLAGS)")
-          s = s.replace("CFLAGS := $(COMMON_CFLAGS) $(BITNESS_FLAGS)", "CFLAGS ?= $(COMMON_CFLAGS) $(BITNESS_FLAGS)")
-
-          p.write_text(s)
+          if p.exists():
+              s = p.read_text()
+              s = s.replace("HOST_ARCH := $(shell arch)", "HOST_ARCH ?= aarch64")
+              s = s.replace("LDFLAGS := $(COMMON_LDFLAGS)", "LDFLAGS ?= $(COMMON_LDFLAGS)")
+              s = s.replace("CFLAGS := $(COMMON_CFLAGS) $(BITNESS_FLAGS)", "CFLAGS ?= $(COMMON_CFLAGS) $(BITNESS_FLAGS)")
+              p.write_text(s)
           PY
 
           echo "===== Makefile diff ====="
@@ -118,214 +117,68 @@ jobs:
         shell: bash
         run: |
           python3 - <<'PY'
-          from pathlib import Path
           import re
+          from pathlib import Path
 
-          def replace_or_warn(path_str, old, new, count=1):
-            p = Path(path_str)
-            s = p.read_text()
-            if old in s:
-              s = s.replace(old, new, count)
-              p.write_text(s)
+          def patch_file(path, patches):
+              p = Path(path)
+              if not p.exists(): return
+              content = p.read_text(encoding='utf-8')
+              for pattern, repl in patches:
+                  content = re.sub(pattern, repl, content, flags=re.DOTALL | re.MULTILINE)
+              p.write_text(content, encoding='utf-8')
 
-          def regex_replace_or_warn(path_str, pattern, repl, flags=0, count=0):
-            p = Path(path_str)
-            s = p.read_text()
-            ns, n = re.subn(pattern, repl, s, flags=flags, count=count)
-            if n:
-              p.write_text(ns)
+          # 1) engine/engine-rpc.h
+          patch_file("engine/engine-rpc.h", [
+              (r'#include\s+<x86intrin\.h>', '#if defined(__i386__) || defined(__x86_64__)\n#include <x86intrin.h>\n#endif')
+          ])
 
-          # 1) engine/engine-rpc.h: x86intrin only on x86
-          p = Path("engine/engine-rpc.h")
-          s = p.read_text()
-          s = s.replace(
-            '#include <x86intrin.h>',
-            '#if defined(__i386__) || defined(__x86_64__)\n#include <x86intrin.h>\n#endif'
-          )
-          p.write_text(s)
+          # 2) common/precise-time.h
+          patch_file("common/precise-time.h", [
+              (r'#endif\s*/\*\s*net-event\.h\s*\*/', '#else\nstatic __inline__ unsigned long long rdtsc(void) {\n  struct timespec ts;\n  clock_gettime(CLOCK_MONOTONIC_RAW, &ts);\n  return (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec;\n}\n#endif\n/* net-event.h */')
+          ])
 
-          # 2) common/precise-time.h: rdtsc fallback for non-x86
-          p = Path("common/precise-time.h")
-          s = p.read_text()
-          if "CLOCK_MONOTONIC_RAW" not in s:
-            marker = "#endif\n\n/* net-event.h */"
-            repl = (
-              "#else\n"
-              "static __inline__ unsigned long long rdtsc(void) {\n"
-              "  struct timespec ts;\n"
-              "  clock_gettime(CLOCK_MONOTONIC_RAW, &ts);\n"
-              "  return (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec;\n"
-              "}\n"
-              "#endif\n\n/* net-event.h */"
-            )
-            s = s.replace(marker, repl, 1)
-            p.write_text(s)
+          # 3) common/server-functions.h
+          patch_file("common/server-functions.h", [
+              (r'static\s+inline\s+void\s+mfence\s*\(\s*void\s*\)\s*\{\s*asm\s+volatile\s*\(\s*"mfence"\s*:\s*:\s*:"memory"\s*\);\s*\}', 'static inline void mfence (void) {\n#if defined(__i386__) || defined(__x86_64__)\n  asm volatile ("mfence": : :"memory");\n#else\n  __sync_synchronize();\n#endif\n}')
+          ])
 
-          # 3) common/server-functions.h: mfence fallback for non-x86
-          p = Path("common/server-functions.h")
-          s = p.read_text()
-          old = '''static inline void mfence (void) {
-            asm volatile ("mfence": : :"memory");
-          }'''
-          new = '''static inline void mfence (void) {
-          #if defined(__i386__) || defined(__x86_64__)
-            asm volatile ("mfence": : :"memory");
-          #else
-            __sync_synchronize();
-          #endif
-          }'''
-          if old in s:
-            s = s.replace(old, new, 1)
-            p.write_text(s)
+          # 4) jobs/jobs.h & jobs.c
+          patch_file("jobs/jobs.h", [
+              (r'struct\s+drand48_data\s+rand_data;', 'unsigned short rand_data[3];')
+          ])
+          patch_file("jobs/jobs.c", [
+              (r'lrand48_r\s*\([^,]+,\s*&t\);', 'return nrand48(this_job_thread->rand_data);'),
+              (r'mrand48_r\s*\([^,]+,\s*&t\);', 'return jrand48(this_job_thread->rand_data);'),
+              (r'drand48_r\s*\([^,]+,\s*&t\);', 'return erand48(this_job_thread->rand_data);'),
+              (r'srand48_r\s*\([^;]+;', '{\n  unsigned long long seed = (unsigned long long)rdtsc() ^ (unsigned long long)lrand48();\n  JT->rand_data[0] = (unsigned short)(seed & 0xffffu);\n  JT->rand_data[1] = (unsigned short)((seed >> 16) & 0xffffu);\n  JT->rand_data[2] = (unsigned short)((seed >> 32) & 0xffffu);\n}')
+          ])
 
-          # 4) jobs/jobs.h: musl-compatible RNG state
-          replace_or_warn(
-            "jobs/jobs.h",
-            "  struct drand48_data rand_data;",
-            "  unsigned short rand_data[3];"
-          )
+          # 5) common/cpuid.c (The main culprit)
+          patch_file("common/cpuid.c", [
+              (r'#include\s+<cpuid\.h>', '#if defined(__i386__) || defined(__x86_64__)\n#include <cpuid.h>\n#endif'),
+              (r'kdb_cpuid_t\s*\*kdb_cpuid\s*\(void\)\s*\{.*?return\s*&cached;\s*\}', 'kdb_cpuid_t *kdb_cpuid (void) {\n#if defined(__i386__) || defined(__x86_64__)\n  static kdb_cpuid_t cached = { .magic = 0 };\n  if (cached.magic) {\n    assert (cached.magic == CPUID_MAGIC);\n    return &cached;\n  }\n  unsigned int a;\n  assert(__get_cpuid(1, &a, (unsigned int*) &cached.ebx, (unsigned int*) &cached.ecx, (unsigned int*) &cached.edx) != 0);\n  cached.magic = CPUID_MAGIC;\n  return &cached;\n#else\n  static kdb_cpuid_t cached = { .magic = 0x280147b8, .ebx = 0, .ecx = 0, .edx = 0 };\n  return &cached;\n#endif\n}')
+          ])
 
-          # 5) jobs/jobs.c: replace glibc *_r RNG API with xsubi[3] family
-          p = Path("jobs/jobs.c")
-          s = p.read_text()
-          pairs = [
-            (
-              "    long int t;\n    lrand48_r (&this_job_thread->rand_data, &t);\n    return t;",
-              "    return nrand48 (this_job_thread->rand_data);"
-            ),
-            (
-              "    long int t;\n    mrand48_r (&this_job_thread->rand_data, &t);\n    return t;",
-              "    return jrand48 (this_job_thread->rand_data);"
-            ),
-            (
-              "    double t;\n    drand48_r (&this_job_thread->rand_data, &t);\n    return t;",
-              "    return erand48 (this_job_thread->rand_data);"
-            ),
-            (
-              "  srand48_r (rdtsc () ^ lrand48 (), &JT->rand_data);",
-              "  {\n"
-              "    unsigned long long seed = (unsigned long long)rdtsc() ^ (unsigned long long)lrand48();\n"
-              "    JT->rand_data[0] = (unsigned short)(seed & 0xffffu);\n"
-              "    JT->rand_data[1] = (unsigned short)((seed >> 16) & 0xffffu);\n"
-              "    JT->rand_data[2] = (unsigned short)((seed >> 32) & 0xffffu);\n"
-              "  }"
-            ),
-          ]
-          for old, new in pairs:
-            if old in s:
-              s = s.replace(old, new, 1)
-          p.write_text(s)
+          # 6) common/crc32c.c and common/crc32.c
+          patch_file("common/crc32c.c", [
+              (r'#include\s+<wmmintrin\.h>', '#if defined(__i386__) || defined(__x86_64__)\n#include <wmmintrin.h>\n#endif'),
+              (r'#ifdef\s+__LP64__', '#if defined(__x86_64__)'),
+              (r'#else\s*static\s+unsigned\s+crc32c_partial_sse42', '#elif defined(__i386__)\nstatic unsigned crc32c_partial_sse42'),
+              (r'void\s+crc32c_init\s*\(void\)\s*\{.*?\}', 'void crc32c_init (void) {\n  compute_crc32c_combine = &crc32c_combine_generic;\n#if defined(__i386__) || defined(__x86_64__)\n  kdb_cpuid_t *p = kdb_cpuid ();\n  if (p->ecx & (1 << 20)) {\n    crc32c_partial = crc32c_partial_sse42;\n  #ifdef __x86_64__\n    if (p->ecx & 2) {\n      crc32c_partial = crc32c_partial_sse42_clmul;\n      compute_crc32c_combine = &crc32c_combine_clmul;\n    }\n  #endif\n  } else {\n    crc32c_partial = &crc32c_partial_four_tables;\n  }\n#else\n  crc32c_partial = &crc32c_partial_four_tables;\n#endif\n}')
+          ])
+          
+          patch_file("common/crc32.c", [
+              (r'#include\s+<wmmintrin\.h>', '#if defined(__i386__) || defined(__x86_64__)\n#include <wmmintrin.h>\n#endif'),
+              (r'void\s+crc32_init\s*\(void\)\s*\{.*?\}', 'void crc32_init (void) {\n#if defined(__i386__) || defined(__x86_64__)\n  kdb_cpuid_t *p = kdb_cpuid ();\n  if (p->ecx & 2) {\n    crc32_partial = crc32_partial_clmul;\n    crc64_partial = crc64_partial_clmul;\n    compute_crc32_combine = compute_crc32_combine_clmul;\n    compute_crc64_combine = compute_crc64_combine_clmul;\n  } else {\n    crc32_partial = crc32_partial_generic;\n    crc64_partial = crc64_partial_one_table;\n    compute_crc32_combine = compute_crc32_combine_generic;\n    compute_crc64_combine = compute_crc64_combine_generic;\n  }\n#else\n  crc32_partial = crc32_partial_generic;\n  crc64_partial = crc64_partial_one_table;\n  compute_crc32_combine = compute_crc32_combine_generic;\n  compute_crc64_combine = compute_crc64_combine_generic;\n#endif\n}')
+          ])
 
-          # 6) common/cpuid.c: stub on non-x86
-          p = Path("common/cpuid.c")
-          s = p.read_text()
-          s = s.replace(
-            '#include <cpuid.h>\n\n#include "cpuid.h"\n',
-            '#if defined(__i386__) || defined(__x86_64__)\n#include <cpuid.h>\n#endif\n\n#include "cpuid.h"\n',
-            1
-          )
-          regex_replace_or_warn(
-            "common/cpuid.c",
-            r'kdb_cpuid_t \*kdb_cpuid \(void\) \{.*?\n\}',
-            '''kdb_cpuid_t *kdb_cpuid (void) {
-          #if defined(__i386__) || defined(__x86_64__)
-            static kdb_cpuid_t cached = { .magic = 0 };
-            if (cached.magic) {
-              assert (cached.magic == CPUID_MAGIC);
-              return &cached;
-            }
-
-            unsigned int a;
-            assert(
-              __get_cpuid(1,
-                  &a,
-                  (unsigned int*) &cached.ebx,
-                  (unsigned int*) &cached.ecx,
-                  (unsigned int*) &cached.edx
-              ) != 0
-            );
-
-            cached.magic = CPUID_MAGIC;
-            return &cached;
-          #else
-            static kdb_cpuid_t cached = { .magic = CPUID_MAGIC, .ebx = 0, .ecx = 0, .edx = 0 };
-            return &cached;
-          #endif
-          }''',
-            flags=re.S,
-            count=1
-          )
-
-          # 7) common/crc32c.c: avoid x86 intrinsics/asm on aarch64
-          p = Path("common/crc32c.c")
-          s = p.read_text()
-          s = s.replace(
-            "#include <wmmintrin.h>",
-            "#if defined(__i386__) || defined(__x86_64__)\n#include <wmmintrin.h>\n#endif",
-            1
-          )
-          s = s.replace("#ifdef __LP64__", "#if defined(__x86_64__)", 1)
-          s = s.replace(
-            "\n#else\nstatic unsigned crc32c_partial_sse42 (const void *data, long len, unsigned crc) {",
-            "\n#elif defined(__i386__)\nstatic unsigned crc32c_partial_sse42 (const void *data, long len, unsigned crc) {",
-            1
-          )
-          s = re.sub(
-            r'void crc32c_init \(void\) \{.*?\n\}',
-            '''void crc32c_init (void) {
-            compute_crc32c_combine = &crc32c_combine_generic;
-          #if defined(__i386__) || defined(__x86_64__)
-            kdb_cpuid_t *p = kdb_cpuid ();
-            if (p->ecx & (1 << 20)) {
-              crc32c_partial = crc32c_partial_sse42;
-            #ifdef __x86_64__
-              if (p->ecx & 2) {
-                crc32c_partial = crc32c_partial_sse42_clmul;
-                compute_crc32c_combine = &crc32c_combine_clmul;
-              }
-            #endif
-            } else {
-              crc32c_partial = &crc32c_partial_four_tables;
-            }
-          #else
-            crc32c_partial = &crc32c_partial_four_tables;
-          #endif
-          }''',
-            s,
-            flags=re.S,
-            count=1
-          )
-          p.write_text(s)
-
-          # 8) common/server-functions.c: execinfo.h missing on musl/OpenWrt
-          p = Path("common/server-functions.c")
-          s = p.read_text()
-          s = s.replace(
-            "#include <execinfo.h>",
-            "#if defined(__GLIBC__)\n#include <execinfo.h>\n#endif",
-            1
-          )
-
-          s = s.replace(
-            "  void *trace[16];\n  int trace_size = backtrace (trace, 16);\n  kprintf (\"------- Stack Backtrace -------\\n\");\n  backtrace_symbols_fd (trace, trace_size, 2);\n  kprintf (\"-------------------------------\\n\");",
-            "#if defined(__GLIBC__)\n"
-            "  void *trace[16];\n"
-            "  int trace_size = backtrace (trace, 16);\n"
-            "  kprintf (\"------- Stack Backtrace -------\\n\");\n"
-            "  backtrace_symbols_fd (trace, trace_size, 2);\n"
-            "  kprintf (\"-------------------------------\\n\");\n"
-            "#else\n"
-            "  kprintf (\"------- Stack Backtrace -------\\n\");\n"
-            "  kprintf (\"backtrace unavailable on this libc\\n\");\n"
-            "  kprintf (\"-------------------------------\\n\");\n"
-            "#endif"
-          )
-          p.write_text(s)
-
+          # 7) common/server-functions.c
+          patch_file("common/server-functions.c", [
+              (r'#include\s+<execinfo\.h>', '#if defined(__GLIBC__)\n#include <execinfo.h>\n#endif'),
+              (r'void\s+print_backtrace\s*\(void\)\s*\{.*?\}', 'void print_backtrace (void) {\n#if defined(__GLIBC__)\n  void *buffer[64];\n  int nptrs = backtrace (buffer, 64);\n  kwrite (2, "\\n------- Stack Backtrace -------\\n", 33);\n  backtrace_symbols_fd (buffer, nptrs, 2);\n  kwrite (2, "-------------------------------\\n", 32);\n  const char *s = get_version_string ();\n  if (s) {\n    kwrite (2, s, strlen (s));\n    kwrite (2, "\\n", 1);\n  }\n#else\n  kwrite (2, "\\n------- Stack Backtrace -------\\n", 33);\n  kwrite (2, "backtrace unavailable on musl\\n", 30);\n  kwrite (2, "-------------------------------\\n", 32);\n#endif\n}')
+          ])
           PY
-
-          echo "===== grep after patch ====="
-          grep -RIn "x86intrin.h\|wmmintrin.h\|drand48_data\|srand48_r\|lrand48_r\|mrand48_r\|drand48_r\|__get_cpuid\|execinfo.h\|backtrace" engine jobs common || true
 
       - name: Build MTProxy (static musl)
         shell: bash
