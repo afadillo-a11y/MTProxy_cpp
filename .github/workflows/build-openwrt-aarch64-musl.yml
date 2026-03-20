@@ -124,8 +124,9 @@ jobs:
               p = Path(path)
               if not p.exists(): return
               content = p.read_text(encoding='utf-8')
+              # Используем lambda чтобы re.sub не экранировал \n внутри C-строк
               for pattern, repl in patches:
-                  content = re.sub(pattern, repl, content, flags=re.DOTALL)
+                  content = re.sub(pattern, lambda _, r=repl: r, content, flags=re.DOTALL)
               p.write_text(content, encoding='utf-8')
 
           # 1) engine/engine-rpc.h
@@ -176,7 +177,24 @@ jobs:
           # 7) common/server-functions.c
           patch_file("common/server-functions.c", [
               (r'#include\s+<execinfo\.h>', '#if defined(__GLIBC__)\n#include <execinfo.h>\n#endif'),
-              (r'void\s+print_backtrace\s*\(void\)\s*\{.*?\}', 'void print_backtrace (void) {\n#if defined(__GLIBC__)\n  void *buffer[64];\n  int nptrs = backtrace (buffer, 64);\n  kwrite (2, "\\n------- Stack Backtrace -------\\n", 33);\n  backtrace_symbols_fd (buffer, nptrs, 2);\n  kwrite (2, "-------------------------------\\n", 32);\n  const char *s = get_version_string ();\n  if (s) {\n    kwrite (2, s, strlen (s));\n    kwrite (2, "\\n", 1);\n  }\n#else\n  kwrite (2, "\\n------- Stack Backtrace -------\\n", 33);\n  kwrite (2, "backtrace unavailable on musl\\n", 30);\n  kwrite (2, "-------------------------------\\n", 32);\n#endif\n}')
+              (r'void\s+print_backtrace\s*\(void\)\s*\{.*?\}', '''void print_backtrace (void) {
+#if defined(__GLIBC__)
+  void *buffer[64];
+  int nptrs = backtrace (buffer, 64);
+  kwrite (2, "\\n------- Stack Backtrace -------\\n", 33);
+  backtrace_symbols_fd (buffer, nptrs, 2);
+  kwrite (2, "-------------------------------\\n", 32);
+  const char *s = get_version_string ();
+  if (s) {
+    kwrite (2, s, strlen (s));
+    kwrite (2, "\\n", 1);
+  }
+#else
+  kwrite (2, "\\n------- Stack Backtrace -------\\n", 33);
+  kwrite (2, "backtrace unavailable on musl\\n", 30);
+  kwrite (2, "-------------------------------\\n", 32);
+#endif
+}''')
           ])
           PY
 
