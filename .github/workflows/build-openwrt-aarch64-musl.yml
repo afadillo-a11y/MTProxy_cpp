@@ -176,7 +176,7 @@ jobs:
           # 7) common/server-functions.c
           patch_file("common/server-functions.c", [
               (r'#include\s+<execinfo\.h>', '#if defined(__GLIBC__)\n#include <execinfo.h>\n#endif'),
-              (r'void\s+print_backtrace\s*\(void\)\s*\{.*?\}', 
+              (r'void\s+print_backtrace\s*\(void\)\s*\{.*?\n\}\n*(?=pthread_t\s+debug_main_pthread_id;)', 
                'void print_backtrace (void) {\n'
                '#if defined(__GLIBC__)\n'
                '  void *buffer[64];\n'
@@ -194,7 +194,7 @@ jobs:
                '  kwrite (2, "backtrace unavailable on musl\\n", 30);\n'
                '  kwrite (2, "-------------------------------\\n", 32);\n'
                '#endif\n'
-               '}')
+               '}\n\n')
           ])
           PY
 
